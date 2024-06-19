@@ -6,7 +6,7 @@
 //
 
 import Foundation
-import CryptoKit
+import Crypto
 
 public enum EventError: Error {
     case stringSerialization
