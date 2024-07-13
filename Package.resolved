@@ -1,6 +1,15 @@
 {
-  "originHash" : "0b048f39cbe0a09babad72ada4890fa08b62cdbe3b044860f99593bd5baef40f",
+  "originHash" : "44739ff864d3a03a39d9ef8bdde2a791a553777a0ec8cfa2d94650f9bb5138a4",
   "pins" : [
+    {
+      "identity" : "corenostr",
+      "kind" : "remoteSourceControl",
+      "location" : "git@github.com:SparrowTek/CoreNostr.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "13a0d10e3e22e6a82a082ad369fbd7db71f85bd5"
+      }
+    },
     {
       "identity" : "secp256k1.swift",
       "kind" : "remoteSourceControl",
@@ -15,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-crypto.git",
       "state" : {
-        "revision" : "bc1c29221f6dfeb0ebbfbc98eb95cd3d4967868e",
-        "version" : "3.4.0"
+        "revision" : "46072478ca365fe48370993833cb22de9b41567f",
+        "version" : "3.5.2"
       }
     }
   ],
