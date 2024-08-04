@@ -9,7 +9,7 @@ import Foundation
 
 public typealias WebSocketStream = AsyncThrowingStream<URLSessionWebSocketTask.Message, Error>
 
-class SocketStream: AsyncSequence {
+class SocketStream: AsyncSequence, @unchecked Sendable {
     typealias AsyncIterator = WebSocketStream.Iterator
     typealias Element = URLSessionWebSocketTask.Message
 
@@ -28,20 +28,18 @@ class SocketStream: AsyncSequence {
             continuation?.finish()
             return
         }
-
-        task.receive(completionHandler: { [weak self] result in
-            guard let continuation = self?.continuation else {
-                return
-            }
-
+        
+        task.receive { [weak self] result in
+            guard let self, let continuation else { return }
+            
             do {
                 let message = try result.get()
                 continuation.yield(message)
-                self?.waitForNextValue()
+                waitForNextValue()
             } catch {
                 continuation.finish(throwing: error)
             }
-        })
+        }
     }
 
     init(task: URLSessionWebSocketTask) {
