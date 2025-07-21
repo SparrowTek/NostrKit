@@ -1,4 +1,5 @@
 import Foundation
+import CoreNostr
 
 /// An asynchronous stream of WebSocket messages.
 ///
@@ -59,6 +60,10 @@ class SocketStream: AsyncSequence, @unchecked Sendable {
     func makeAsyncIterator() -> AsyncIterator {
         return stream.makeAsyncIterator()
     }
+    
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {
+        try await task.send(message)
+    }
 
     func cancel() async throws {
         task.cancel(with: .goingAway, reason: nil)
@@ -68,114 +73,274 @@ class SocketStream: AsyncSequence, @unchecked Sendable {
 
 /// Errors that can occur when using RelayService.
 public enum RelayServiceError: Error, Sendable {
-    /// The provided URL is invalid or nil.
-    case badURL
+    /// The provided URL is invalid
+    case invalidURL(String)
+    /// Connection failed
+    case connectionFailed(Error)
+    /// Message encoding failed
+    case encodingFailed(Error)
+    /// Message decoding failed
+    case decodingFailed(Error)
+    /// Authentication required but no authenticator provided
+    case authenticationRequired
+    /// Not connected to relay
+    case notConnected
 }
 
-/// Service for managing WebSocket connections to NOSTR relays.
+/// Service for managing a WebSocket connection to a single NOSTR relay.
 ///
-/// RelayService provides functionality to connect to multiple NOSTR relays,
-/// send requests, and listen for incoming messages. It handles the WebSocket
-/// connections using URLSession and provides an async/await interface.
+/// RelayService provides functionality to connect to a NOSTR relay,
+/// send and receive messages, and handle authentication (NIP-42).
 ///
 /// ## Example Usage
 /// ```swift
-/// let service = RelayService()
-/// try service.connectToSocket(URL(string: "wss://relay.nostr.com"))
+/// let relay = RelayService(url: "wss://relay.damus.io")
 /// 
-/// // Send a request
-/// try await service.sendRequest()
+/// // Set up authentication if needed
+/// relay.authenticator = { challenge in
+///     return try await AuthResponse.create(for: challenge, using: keyPair)
+/// }
+/// 
+/// // Connect to relay
+/// try await relay.connect()
+/// 
+/// // Send an event
+/// let event = try CoreNostr.createTextNote(content: "Hello!", keyPair: keyPair)
+/// try await relay.publishEvent(event)
+/// 
+/// // Subscribe to events
+/// try await relay.subscribe(id: "sub1", filters: [Filter(kinds: [.textNote])])
 /// 
 /// // Listen for messages
-/// try await service.listen()
+/// for await message in relay.messages {
+///     switch message {
+///     case .event(let subId, let event):
+///         print("Received event on subscription \(subId)")
+///     default:
+///         break
+///     }
+/// }
 /// ```
-///
-/// - Note: This service maintains multiple concurrent WebSocket connections
-///         and processes messages from all connected relays.
 public actor RelayService {
-    /// Array of active WebSocket streams.
-    private var streams: [SocketStream] = []
     
-    /// Connects to a NOSTR relay via WebSocket.
-    ///
-    /// Creates a new WebSocket connection to the specified relay URL and
-    /// adds it to the list of managed streams. The connection will remain
-    /// open until explicitly closed or an error occurs.
-    ///
-    /// - Parameter url: The WebSocket URL of the NOSTR relay (must use ws:// or wss://)
-    /// - Throws: ``RelayServiceError/badURL`` if the URL is nil or invalid
-    public func connectToSocket(_ url: URL?) throws(RelayServiceError) {
-        guard let url else { throw .badURL }
-        let socketConnection = URLSession.shared.webSocketTask(with: url)
-        let socketStream = SocketStream(task: socketConnection)
-        streams.append(socketStream)
+    // MARK: - Properties
+    
+    /// The relay URL
+    public let url: String
+    
+    /// The WebSocket stream for this relay
+    private var stream: SocketStream?
+    
+    /// Current authentication status
+    private var authStatus: AuthenticationStatus = .notAuthenticated
+    
+    /// Authentication handler for NIP-42
+    public var authenticator: ((AuthChallenge) async throws -> AuthResponse)?
+    
+    /// Continuation for the message stream
+    private var messageContinuation: AsyncStream<RelayMessage>.Continuation?
+    
+    /// Stream of incoming relay messages
+    public let messages: AsyncStream<RelayMessage>
+    
+    /// Whether the relay is currently connected
+    public var isConnected: Bool {
+        stream != nil
     }
     
-    /// Sends a request to all connected relays.
-    ///
-    /// This method is currently a placeholder for sending NOSTR protocol
-    /// messages to connected relays. Implementation should encode the request
-    /// according to the NOSTR protocol specification and send it to all
-    /// active WebSocket connections.
-    ///
-    /// ## TODO
-    /// - Implement proper NOSTR message encoding
-    /// - Add parameters for different request types
-    /// - Handle sending to specific relays vs all relays
-    ///
-    /// - Throws: Any errors from the WebSocket send operation
-    public func sendRequest() async throws {
-        // TODO: Implement request sending logic
-        // Example structure:
-        // let parameters = RequestParameters(kinds: [.contacts], authors: ["..."], limit: 1)
-        // let request = Request(messageType: .req, signature: "...", parameters: parameters)
-        // 
-        // for stream in streams {
-        //     try await stream.send(message)
-        // }
-    }
+    // MARK: - Initialization
     
-    /// Listens for messages from all connected relays.
-    ///
-    /// This method creates concurrent tasks to listen for messages from each
-    /// connected relay. Messages are processed as they arrive from any relay.
-    /// The method will continue listening until all connections are closed
-    /// or an error occurs.
-    ///
-    /// ## Message Handling
-    /// Currently, messages are printed to the console. In a production
-    /// implementation, messages should be:
-    /// - Parsed according to NOSTR protocol
-    /// - Validated for signatures
-    /// - Dispatched to appropriate handlers
-    ///
-    /// ## Example
-    /// ```swift
-    /// let service = RelayService()
-    /// try service.connectToSocket(relayURL)
-    /// 
-    /// // Listen for messages in a Task
-    /// Task {
-    ///     try await service.listen()
-    /// }
-    /// ```
-    ///
-    /// - Throws: Any errors from the WebSocket receive operations
-    /// - Note: This method blocks until all streams are closed
-    public func listen() async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for stream in streams {
-                group.addTask {
-                    for try await message in stream {
-                        // TODO: Implement proper message handling
-                        // - Parse NOSTR protocol messages
-                        // - Validate signatures
-                        // - Dispatch to handlers
-                        print("MESSAGE: \(message)")
-                    }
-                }
-            }
-            try await group.waitForAll()
+    /// Creates a new relay service for the specified URL
+    /// - Parameter url: The WebSocket URL of the relay
+    public init(url: String) {
+        self.url = url
+        
+        var continuation: AsyncStream<RelayMessage>.Continuation?
+        self.messages = AsyncStream { cont in
+            continuation = cont
         }
+        self.messageContinuation = continuation
+    }
+    
+    // MARK: - Connection Management
+    
+    /// Connects to the relay
+    /// - Throws: RelayServiceError if connection fails
+    public func connect() async throws {
+        guard !isConnected else { return }
+        
+        guard let wsURL = URL(string: url),
+              wsURL.scheme == "ws" || wsURL.scheme == "wss" else {
+            throw RelayServiceError.invalidURL(url)
+        }
+        
+        let task = URLSession.shared.webSocketTask(with: wsURL)
+        let socketStream = SocketStream(task: task)
+        self.stream = socketStream
+        
+        // Start listening for messages
+        Task {
+            await listenForMessages()
+        }
+    }
+    
+    /// Disconnects from the relay
+    public func disconnect() async {
+        if let stream = stream {
+            try? await stream.cancel()
+            self.stream = nil
+        }
+        messageContinuation?.finish()
+        authStatus = .notAuthenticated
+    }
+    
+    // MARK: - Message Sending
+    
+    /// Publishes an event to the relay
+    /// - Parameter event: The event to publish
+    /// - Throws: RelayServiceError if not connected or encoding fails
+    public func publishEvent(_ event: NostrEvent) async throws {
+        let message = ClientMessage.event(event)
+        try await sendMessage(message)
+    }
+    
+    /// Subscribes to events matching the specified filters
+    /// - Parameters:
+    ///   - id: The subscription ID
+    ///   - filters: Array of filters for the subscription
+    /// - Throws: RelayServiceError if not connected or encoding fails
+    public func subscribe(id: String, filters: [Filter]) async throws {
+        let message = ClientMessage.req(subscriptionId: id, filters: filters)
+        try await sendMessage(message)
+    }
+    
+    /// Closes a subscription
+    /// - Parameter id: The subscription ID to close
+    /// - Throws: RelayServiceError if not connected or encoding fails
+    public func closeSubscription(id: String) async throws {
+        let message = ClientMessage.close(subscriptionId: id)
+        try await sendMessage(message)
+    }
+    
+    /// Sends an authentication response
+    /// - Parameter event: The auth event (kind 22242)
+    /// - Throws: RelayServiceError if not connected or encoding fails
+    public func sendAuth(_ event: NostrEvent) async throws {
+        let message = ClientMessage.event(event)
+        try await sendMessage(message)
+    }
+    
+    // MARK: - Private Methods
+    
+    private func sendMessage(_ message: ClientMessage) async throws {
+        guard let stream = stream else {
+            throw RelayServiceError.notConnected
+        }
+        
+        do {
+            let jsonData = try JSONEncoder().encode(message)
+            let jsonString = String(data: jsonData, encoding: .utf8)!
+            try await stream.send(.string(jsonString))
+        } catch {
+            throw RelayServiceError.encodingFailed(error)
+        }
+    }
+    
+    private func listenForMessages() async {
+        guard let stream = stream else { return }
+        
+        do {
+            for try await message in stream {
+                await handleWebSocketMessage(message)
+            }
+        } catch {
+            print("[RelayService] WebSocket error: \(error)")
+            messageContinuation?.finish()
+        }
+        
+        // Connection closed
+        self.stream = nil
+        messageContinuation?.finish()
+    }
+    
+    private func handleWebSocketMessage(_ message: URLSessionWebSocketTask.Message) async {
+        switch message {
+        case .string(let text):
+            do {
+                guard let data = text.data(using: .utf8) else {
+                    print("[RelayService] Invalid UTF-8 string")
+                    return
+                }
+                
+                let relayMessage = try JSONDecoder().decode(RelayMessage.self, from: data)
+                
+                // Handle authentication challenges
+                if case .auth(let challenge) = relayMessage {
+                    await handleAuthChallenge(challenge)
+                }
+                
+                messageContinuation?.yield(relayMessage)
+                
+            } catch {
+                print("[RelayService] Failed to decode message: \(error)")
+            }
+            
+        case .data(let data):
+            print("[RelayService] Received unexpected binary data: \(data.count) bytes")
+            
+        @unknown default:
+            print("[RelayService] Received unknown message type")
+        }
+    }
+    
+    private func handleAuthChallenge(_ challenge: String) async {
+        guard let authenticator = authenticator else {
+            print("[RelayService] Received auth challenge but no authenticator set")
+            authStatus = .authenticationRequired(challenge: AuthChallenge(challenge: challenge, relayURL: url))
+            return
+        }
+        
+        authStatus = .authenticating
+        
+        do {
+            let authChallenge = AuthChallenge(challenge: challenge, relayURL: url)
+            let authResponse = try await authenticator(authChallenge)
+            try await sendAuth(authResponse.event)
+            authStatus = .authenticated(since: Date())
+        } catch {
+            print("[RelayService] Authentication failed: \(error)")
+            authStatus = .failed(reason: error.localizedDescription)
+        }
+    }
+}
+
+// MARK: - NIP-42 Authentication Support
+
+extension RelayService {
+    
+    /// Creates an authenticator closure for use with RelayService
+    /// - Parameter keyPair: The key pair to use for authentication
+    /// - Returns: An authenticator closure
+    public static func authenticator(using keyPair: KeyPair) -> (AuthChallenge) async throws -> AuthResponse {
+        return { challenge in
+            try CoreNostr.authenticate(challenge: challenge, keyPair: keyPair)
+        }
+    }
+    
+    /// Current authentication status
+    public var authenticationStatus: AuthenticationStatus {
+        authStatus
+    }
+    
+    /// Manually triggers authentication if supported by the relay
+    /// - Throws: RelayServiceError if no authenticator is set
+    public func authenticate() async throws {
+        guard authenticator != nil else {
+            throw RelayServiceError.authenticationRequired
+        }
+        
+        // Some relays send AUTH immediately on connection
+        // Others require a request that triggers AUTH
+        // For now, we'll wait for the relay to send AUTH
     }
 }
