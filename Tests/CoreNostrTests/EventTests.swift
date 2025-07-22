@@ -10,7 +10,7 @@ struct EventTests {
         
         @Test("Create basic event")
         func testCreateBasicEvent() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let content = "Test content"
             let kind = EventKind.textNote
             let tags: [[String]] = [["t", "nostr"], ["t", "test"]]
@@ -22,17 +22,17 @@ struct EventTests {
                 keyPair: keyPair
             )
             
-            #expect(event.kind == kind)
+            #expect(event.kind == kind.rawValue)
             #expect(event.content == content)
             #expect(event.tags == tags)
-            #expect(event.pubkey == keyPair.publicKey.hex)
-            #expect(event.id.hex.count == 64)
-            #expect(event.signature.hex.count == 128)
+            #expect(event.pubkey == keyPair.publicKey)
+            #expect(event.id.count == 64)
+            #expect(event.sig.count == 128)
         }
         
         @Test("Create event with custom timestamp")
         func testCreateEventWithTimestamp() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let customDate = Date(timeIntervalSince1970: 1234567890)
             
             let event = try CoreNostr.createEvent(
@@ -43,12 +43,12 @@ struct EventTests {
                 createdAt: customDate
             )
             
-            #expect(event.createdAt == customDate)
+            #expect(Date(timeIntervalSince1970: TimeInterval(event.createdAt)) == customDate)
         }
         
         @Test("Create metadata event")
         func testCreateMetadataEvent() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let metadata = UserMetadata(
                 name: "Alice",
                 displayName: "Alice in Nostrland",
@@ -64,7 +64,7 @@ struct EventTests {
                 keyPair: keyPair
             )
             
-            #expect(event.kind == .metadata)
+            #expect(event.kind == EventKind.setMetadata.rawValue)
             
             let decodedMetadata = try JSONDecoder().decode(UserMetadata.self, from: Data(event.content.utf8))
             #expect(decodedMetadata.name == metadata.name)
@@ -74,9 +74,9 @@ struct EventTests {
         
         @Test("Create deletion event")
         func testCreateDeletionEvent() throws {
-            let keyPair = try KeyPair()
-            let eventToDelete1 = EventID(hex: String(repeating: "a", count: 64))
-            let eventToDelete2 = EventID(hex: String(repeating: "b", count: 64))
+            let keyPair = try KeyPair.generate()
+            let eventToDelete1 = String(repeating: "a", count: 64)
+            let eventToDelete2 = String(repeating: "b", count: 64)
             
             let deletionEvent = try CoreNostr.createDeletionEvent(
                 eventIds: [eventToDelete1, eventToDelete2],
@@ -84,11 +84,11 @@ struct EventTests {
                 keyPair: keyPair
             )
             
-            #expect(deletionEvent.kind == .deletion)
+            #expect(deletionEvent.kind == EventKind.deletion.rawValue)
             #expect(deletionEvent.content == "Mistake in content")
             #expect(deletionEvent.tags.count == 2)
-            #expect(deletionEvent.tags[0] == ["e", eventToDelete1.hex])
-            #expect(deletionEvent.tags[1] == ["e", eventToDelete2.hex])
+            #expect(deletionEvent.tags[0] == ["e", eventToDelete1])
+            #expect(deletionEvent.tags[1] == ["e", eventToDelete2])
         }
     }
     
@@ -117,7 +117,7 @@ struct EventTests {
         
         @Test("Event ID calculation")
         func testEventIdCalculation() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let event = try CoreNostr.createTextNote(
                 content: "Test",
                 keyPair: keyPair,
@@ -143,7 +143,7 @@ struct EventTests {
         
         @Test("Signature verification internals")
         func testSignatureVerificationInternals() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let event = try CoreNostr.createTextNote(
                 content: "Verify me",
                 keyPair: keyPair
@@ -170,7 +170,7 @@ struct EventTests {
         
         @Test("Verify valid event")
         func testVerifyValidEvent() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let event = try CoreNostr.createTextNote(
                 content: "Valid event",
                 keyPair: keyPair
@@ -182,7 +182,7 @@ struct EventTests {
         
         @Test("Verify event with tampered content")
         func testVerifyTamperedContent() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             var event = try CoreNostr.createTextNote(
                 content: "Original content",
                 keyPair: keyPair
@@ -205,7 +205,7 @@ struct EventTests {
         
         @Test("Verify event with wrong signature")
         func testVerifyWrongSignature() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             var event = try CoreNostr.createTextNote(
                 content: "Test content",
                 keyPair: keyPair
@@ -234,7 +234,7 @@ struct EventTests {
         
         @Test("Verify event with invalid ID")
         func testVerifyInvalidId() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             var event = try CoreNostr.createTextNote(
                 content: "Test",
                 keyPair: keyPair
@@ -261,7 +261,7 @@ struct EventTests {
         
         @Test("Filter matches event")
         func testFilterMatches() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let event = try CoreNostr.createTextNote(
                 content: "Hello world",
                 keyPair: keyPair,
@@ -287,7 +287,7 @@ struct EventTests {
         
         @Test("Filter with time range")
         func testFilterTimeRange() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let now = Date()
             let event = try CoreNostr.createTextNote(
                 content: "Now",
@@ -312,7 +312,7 @@ struct EventTests {
         
         @Test("Complex filter combinations")
         func testComplexFilter() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let event = try CoreNostr.createTextNote(
                 content: "Complex event",
                 keyPair: keyPair,
@@ -340,7 +340,7 @@ struct EventTests {
         
         @Test("Serialize to JSON")
         func testSerializeToJSON() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let event = try CoreNostr.createTextNote(
                 content: "Serialize me",
                 keyPair: keyPair,
@@ -359,7 +359,7 @@ struct EventTests {
         
         @Test("Deserialize from JSON")
         func testDeserializeFromJSON() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let originalEvent = try CoreNostr.createTextNote(
                 content: "Original",
                 keyPair: keyPair,
@@ -382,7 +382,7 @@ struct EventTests {
         
         @Test("Round-trip serialization preserves event")
         func testRoundTripSerialization() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let event = try CoreNostr.createEvent(
                 kind: .reaction,
                 content: "🚀",

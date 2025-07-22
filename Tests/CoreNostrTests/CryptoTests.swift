@@ -10,12 +10,12 @@ struct CryptoTests {
         
         @Test("Generate new keypair")
         func testGenerateKeyPair() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             
-            #expect(keyPair.publicKey.hex.count == 64)
-            #expect(keyPair.privateKey.hex.count == 64)
-            #expect(keyPair.publicKey.npub.starts(with: "npub1"))
-            #expect(keyPair.privateKey.nsec.starts(with: "nsec1"))
+            #expect(keyPair.publicKey.count == 64)
+            #expect(keyPair.privateKey.count == 64)
+            #expect(keyPair.publicKey.bech32.starts(with: "npub1"))
+            #expect(keyPair.privateKey.bech32.starts(with: "nsec1"))
         }
         
         @Test("Create keypair from private key hex")
@@ -25,17 +25,24 @@ struct CryptoTests {
             
             let keyPair = try KeyPair(privateKey: privateKeyHex)
             
-            #expect(keyPair.privateKey.hex == privateKeyHex)
-            #expect(keyPair.publicKey.hex == expectedPublicKeyHex)
+            #expect(keyPair.privateKey == privateKeyHex)
+            #expect(keyPair.publicKey == expectedPublicKeyHex)
         }
         
         @Test("Create keypair from nsec")
         func testKeyPairFromNsec() throws {
             let nsec = "nsec16zw3qmajnwclzatjexhf0wudet7c6jyc67lyqykysawldrwacuxqahjrda"
-            let keyPair = try KeyPair(nsec: nsec)
+            let entity = try Bech32Entity(from: nsec)
             
-            #expect(keyPair.privateKey.nsec == nsec)
-            #expect(keyPair.publicKey.hex.count == 64)
+            guard case .nsec(let privateKey) = entity else {
+                Issue.record("Expected nsec entity")
+                return
+            }
+            
+            let keyPair = try KeyPair(privateKey: privateKey)
+            
+            #expect(try Bech32.encode(hrp: .nsec, data: Data(hex: keyPair.privateKey)) == nsec)
+            #expect(keyPair.publicKey.count == 64)
         }
         
         @Test("Invalid private key throws error")
@@ -51,12 +58,12 @@ struct CryptoTests {
         
         @Test("Sign and verify message")
         func testSignAndVerify() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let message = "Hello, Nostr!"
             
             let signature = try keyPair.sign(message: message)
             
-            #expect(signature.hex.count == 128)
+            #expect(signature.count == 128)
             
             let isValid = try keyPair.verify(signature: signature, for: message)
             #expect(isValid == true)
@@ -68,7 +75,7 @@ struct CryptoTests {
         
         @Test("Schnorr signature format")
         func testSchnorrSignature() throws {
-            let keyPair = try KeyPair()
+            let keyPair = try KeyPair.generate()
             let message = Data("Test message".utf8)
             
             let signature = try keyPair.schnorrSign(message: message)
@@ -170,7 +177,7 @@ struct CryptoTests {
             
             let seed = try BIP39.mnemonicToSeed(mnemonic: mnemonic, passphrase: passphrase)
             
-            #expect(seed.hex == "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04")
+            #expect(seed == "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04")
         }
         
         @Test("Validate mnemonic")
@@ -268,8 +275,8 @@ struct CryptoTests {
             
             let privateKey = try NIP06.deriveNostrPrivateKey(from: mnemonic, passphrase: passphrase)
             
-            #expect(privateKey.hex.count == 64)
-            #expect(privateKey.nsec.starts(with: "nsec1"))
+            #expect(privateKey.count == 64)
+            #expect(privateKey.bech32.starts(with: "nsec1"))
         }
         
         @Test("Derive with account index")
@@ -279,7 +286,7 @@ struct CryptoTests {
             let account0 = try NIP06.deriveNostrPrivateKey(from: mnemonic, accountIndex: 0)
             let account1 = try NIP06.deriveNostrPrivateKey(from: mnemonic, accountIndex: 1)
             
-            #expect(account0.hex != account1.hex)
+            #expect(account0 != account1)
         }
         
         @Test("Standard derivation path")
@@ -318,7 +325,7 @@ struct CryptoTests {
             let hash = NostrCrypto.sha256(data)
             
             #expect(hash.count == 32)
-            #expect(hash.hex == "7e3d87e53ba7e82fe36dd18cd515e2cee2f265a784de2549a8c91932ce65b5a7")
+            #expect(hash == "7e3d87e53ba7e82fe36dd18cd515e2cee2f265a784de2549a8c91932ce65b5a7")
         }
         
         @Test("HMAC-SHA256")
@@ -329,7 +336,7 @@ struct CryptoTests {
             let hmac = try NostrCrypto.hmacSHA256(key: key, message: message)
             
             #expect(hmac.count == 32)
-            #expect(hmac.hex == "6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a")
+            #expect(hmac == "6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a")
         }
         
         @Test("AES encryption and decryption")

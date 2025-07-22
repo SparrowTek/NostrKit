@@ -25,7 +25,9 @@ class SocketStream: AsyncSequence, @unchecked Sendable {
     private lazy var stream: WebSocketStream = {
         return WebSocketStream { continuation in
             self.continuation = continuation
-            waitForNextValue()
+            Task {
+                self.waitForNextValue()
+            }
         }
     }()
 
@@ -191,6 +193,7 @@ public actor RelayService {
             self.stream = nil
         }
         messageContinuation?.finish()
+        messageContinuation = nil
         authStatus = .notAuthenticated
     }
     
@@ -238,8 +241,7 @@ public actor RelayService {
         }
         
         do {
-            let jsonData = try JSONEncoder().encode(message)
-            let jsonString = String(data: jsonData, encoding: .utf8)!
+            let jsonString = try message.encode()
             try await stream.send(.string(jsonString))
         } catch {
             throw RelayServiceError.encodingFailed(error)
@@ -267,12 +269,7 @@ public actor RelayService {
         switch message {
         case .string(let text):
             do {
-                guard let data = text.data(using: .utf8) else {
-                    print("[RelayService] Invalid UTF-8 string")
-                    return
-                }
-                
-                let relayMessage = try JSONDecoder().decode(RelayMessage.self, from: data)
+                let relayMessage = try RelayMessage.decode(from: text)
                 
                 // Handle authentication challenges
                 if case .auth(let challenge) = relayMessage {
