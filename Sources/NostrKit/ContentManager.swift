@@ -863,9 +863,18 @@ extension ContentManager {
             if let range = Range(match.range, in: content),
                let npubRange = Range(match.range(at: 1), in: content) {
                 let npub = String(content[npubRange])
-                // TODO: Decode npub to hex pubkey
-                // For now, use the npub as-is
-                mentions.append((range, npub))
+                
+                // Decode npub to hex pubkey
+                let pubkeyHex: String
+                if let entity = try? Bech32Entity(from: npub),
+                   case .npub(let pubkey) = entity {
+                    pubkeyHex = pubkey
+                } else {
+                    // If decoding fails, use the npub as-is (fallback)
+                    pubkeyHex = npub
+                }
+                
+                mentions.append((range, pubkeyHex))
             }
         }
         

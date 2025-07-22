@@ -1,5 +1,6 @@
 import Foundation
 import CoreNostr
+import CryptoKit
 
 /// High-level encryption manager that provides various encryption schemes for NOSTR.
 ///
@@ -722,15 +723,62 @@ private struct Rumor: Codable, Sendable {
 extension NostrCrypto {
     /// AES-GCM encryption
     static func aesGCMEncrypt(plaintext: Data, key: Data, nonce: Data) throws -> Data {
-        // Implementation would use CryptoKit's AES.GCM
-        // This is a placeholder
-        return try NostrCrypto.aesEncrypt(plaintext: plaintext, key: key, iv: nonce)
+        // Convert key to SymmetricKey
+        let symmetricKey = SymmetricKey(data: key)
+        
+        // AES-GCM requires a 12-byte nonce
+        let gcmNonce: AES.GCM.Nonce
+        if nonce.count == 12 {
+            gcmNonce = try AES.GCM.Nonce(data: nonce)
+        } else if nonce.count > 12 {
+            // Use first 12 bytes if nonce is longer
+            gcmNonce = try AES.GCM.Nonce(data: nonce.prefix(12))
+        } else {
+            // Pad with zeros if nonce is shorter
+            var paddedNonce = nonce
+            paddedNonce.append(Data(repeating: 0, count: 12 - nonce.count))
+            gcmNonce = try AES.GCM.Nonce(data: paddedNonce)
+        }
+        
+        // Encrypt using AES-GCM
+        let sealedBox = try AES.GCM.seal(plaintext, using: symmetricKey, nonce: gcmNonce)
+        
+        // Return combined ciphertext and tag
+        // AES-GCM produces ciphertext + 16-byte authentication tag
+        return sealedBox.ciphertext + sealedBox.tag
     }
     
     /// AES-GCM decryption
     static func aesGCMDecrypt(ciphertext: Data, key: Data, nonce: Data) throws -> Data {
-        // Implementation would use CryptoKit's AES.GCM
-        // This is a placeholder
-        return try NostrCrypto.aesDecrypt(ciphertext: ciphertext, key: key, iv: nonce)
+        // Convert key to SymmetricKey
+        let symmetricKey = SymmetricKey(data: key)
+        
+        // AES-GCM requires a 12-byte nonce
+        let gcmNonce: AES.GCM.Nonce
+        if nonce.count == 12 {
+            gcmNonce = try AES.GCM.Nonce(data: nonce)
+        } else if nonce.count > 12 {
+            // Use first 12 bytes if nonce is longer
+            gcmNonce = try AES.GCM.Nonce(data: nonce.prefix(12))
+        } else {
+            // Pad with zeros if nonce is shorter
+            var paddedNonce = nonce
+            paddedNonce.append(Data(repeating: 0, count: 12 - nonce.count))
+            gcmNonce = try AES.GCM.Nonce(data: paddedNonce)
+        }
+        
+        // Split ciphertext and tag
+        guard ciphertext.count >= 16 else {
+            throw NostrError.encryptionError(operation: .decrypt, reason: "Invalid ciphertext length for AES-GCM")
+        }
+        
+        let actualCiphertext = ciphertext.prefix(ciphertext.count - 16)
+        let tag = ciphertext.suffix(16)
+        
+        // Create sealed box
+        let sealedBox = try AES.GCM.SealedBox(nonce: gcmNonce, ciphertext: actualCiphertext, tag: tag)
+        
+        // Decrypt
+        return try AES.GCM.open(sealedBox, using: symmetricKey)
     }
 }

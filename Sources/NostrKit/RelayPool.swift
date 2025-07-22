@@ -1,6 +1,27 @@
 import Foundation
 import CoreNostr
 
+/// Errors that can occur in relay operations
+public enum RelayError: Error, LocalizedError {
+    case timeout
+    case eventRejected(reason: String?)
+    case connectionFailed(Error)
+    case notConnected
+    
+    public var errorDescription: String? {
+        switch self {
+        case .timeout:
+            return "Operation timed out"
+        case .eventRejected(let reason):
+            return "Event rejected: \(reason ?? "No reason provided")"
+        case .connectionFailed(let error):
+            return "Connection failed: \(error.localizedDescription)"
+        case .notConnected:
+            return "Not connected to relay"
+        }
+    }
+}
+
 /// A pool of relay connections that manages multiple relays with load balancing, health monitoring, and automatic failover.
 ///
 /// The RelayPool provides high-level functionality for:
@@ -164,6 +185,9 @@ public actor RelayPool {
     /// Active subscriptions
     private var subscriptions: [String: PoolSubscription] = [:]
     
+    /// Pending OK responses tracked by relay URL and event ID
+    private var pendingOKResponses: [String: [EventID: CheckedContinuation<PublishResult, Never>]] = [:]
+    
     /// Configuration for the relay pool
     public let configuration: Configuration
     
@@ -240,6 +264,19 @@ public actor RelayPool {
             await relay.service.disconnect()
         }
         
+        // Clean up any pending OK responses
+        if let pendingResponses = pendingOKResponses[url] {
+            for (_, continuation) in pendingResponses {
+                continuation.resume(returning: PublishResult(
+                    relay: url,
+                    success: false,
+                    message: "Relay removed",
+                    error: RelayError.notConnected
+                ))
+            }
+            pendingOKResponses.removeValue(forKey: url)
+        }
+        
         // Remove from pool
         relays.removeValue(forKey: url)
         
@@ -311,6 +348,19 @@ public actor RelayPool {
         await relay.service.disconnect()
         relay.state = .disconnected
         relays[url] = relay
+        
+        // Clean up any pending OK responses
+        if let pendingResponses = pendingOKResponses[url] {
+            for (_, continuation) in pendingResponses {
+                continuation.resume(returning: PublishResult(
+                    relay: url,
+                    success: false,
+                    message: "Relay disconnected",
+                    error: RelayError.notConnected
+                ))
+            }
+            pendingOKResponses.removeValue(forKey: url)
+        }
         
         await delegate?.relayPool(self, didDisconnectFrom: url)
     }
@@ -427,40 +477,70 @@ public actor RelayPool {
     private func publishToRelay(_ event: NostrEvent, relay: Relay) async -> PublishResult {
         let startTime = Date()
         
-        do {
-            try await relay.service.publishEvent(event)
-            
-            // Update statistics
-            if var updatedRelay = relays[relay.url] {
-                updatedRelay.stats.eventsSent += 1
-                updatedRelay.stats.lastActivity = Date()
-                let responseTime = Date().timeIntervalSince(startTime)
-                updatedRelay.stats.averageResponseTime = 
-                    (updatedRelay.stats.averageResponseTime + responseTime) / 2
-                relays[relay.url] = updatedRelay
-            }
-            
-            // Wait for OK response
-            // TODO: Implement proper OK response handling
-            try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second timeout
-            
-            return PublishResult(
-                relay: relay.url,
-                success: true,
-                message: "Event published successfully",
-                error: nil
-            )
-            
-        } catch {
-            await updateHealthScore(for: relay.url, eventType: .publishFailure)
-            
-            return PublishResult(
-                relay: relay.url,
-                success: false,
-                message: nil,
-                error: error
-            )
+        // Set up continuation for OK response
+        let result = await withCheckedContinuation { continuation in
+                // Store the continuation
+                if pendingOKResponses[relay.url] == nil {
+                    pendingOKResponses[relay.url] = [:]
+                }
+                pendingOKResponses[relay.url]?[event.id] = continuation
+                
+                // Send the event and handle timeout
+                Task {
+                    do {
+                        try await relay.service.publishEvent(event)
+                        
+                        // Update statistics for sent event
+                        if var updatedRelay = relays[relay.url] {
+                            updatedRelay.stats.eventsSent += 1
+                            updatedRelay.stats.lastActivity = Date()
+                            relays[relay.url] = updatedRelay
+                        }
+                        
+                        // Set a timeout for OK response
+                        Task {
+                            try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 second timeout
+                            
+                            // Check if continuation is still pending
+                            if let pending = pendingOKResponses[relay.url]?[event.id] {
+                                pendingOKResponses[relay.url]?.removeValue(forKey: event.id)
+                                
+                                // Timeout occurred
+                                pending.resume(returning: PublishResult(
+                                    relay: relay.url,
+                                    success: false,
+                                    message: "Timeout waiting for OK response",
+                                    error: RelayError.timeout
+                                ))
+                            }
+                        }
+                        
+                    } catch {
+                        // Remove pending continuation
+                        pendingOKResponses[relay.url]?.removeValue(forKey: event.id)
+                        
+                        // Resume with error
+                        continuation.resume(returning: PublishResult(
+                            relay: relay.url,
+                            success: false,
+                            message: nil,
+                            error: error
+                        ))
+                    }
+                }
         }
+        
+        // Update response time statistics
+        if result.success, var updatedRelay = relays[relay.url] {
+            let responseTime = Date().timeIntervalSince(startTime)
+            updatedRelay.stats.averageResponseTime = 
+                (updatedRelay.stats.averageResponseTime + responseTime) / 2
+            relays[relay.url] = updatedRelay
+        } else {
+            await updateHealthScore(for: relay.url, eventType: .publishFailure)
+        }
+        
+        return result
     }
     
     private func monitorRelay(url: String) async {
@@ -476,7 +556,20 @@ public actor RelayPool {
                     updatedRelay.stats.eventsReceived += 1
                 case .notice(let notice):
                     print("[RelayPool] Notice from \(url): \(notice)")
-                case .ok(_, let accepted, let message):
+                case .ok(let eventId, let accepted, let message):
+                    // Check if we have a pending continuation for this event
+                    if let continuation = pendingOKResponses[url]?[eventId] {
+                        pendingOKResponses[url]?.removeValue(forKey: eventId)
+                        
+                        // Resume the continuation with the result
+                        continuation.resume(returning: PublishResult(
+                            relay: url,
+                            success: accepted,
+                            message: message,
+                            error: accepted ? nil : RelayError.eventRejected(reason: message)
+                        ))
+                    }
+                    
                     if !accepted {
                         print("[RelayPool] Event rejected by \(url): \(message ?? "No reason")")
                         await updateHealthScore(for: url, eventType: .eventRejected)
@@ -558,7 +651,52 @@ public actor RelayPool {
     }
     
     private func fetchRelayInformation(for url: String) async {
-        // TODO: Implement NIP-11 relay information fetching
+        guard var relay = relays[url] else { return }
+        
+        // Convert WebSocket URL to HTTP(S) URL
+        var httpURL = url
+        if httpURL.hasPrefix("wss://") {
+            httpURL = httpURL.replacingOccurrences(of: "wss://", with: "https://")
+        } else if httpURL.hasPrefix("ws://") {
+            httpURL = httpURL.replacingOccurrences(of: "ws://", with: "http://")
+        }
+        
+        // Ensure URL has trailing slash
+        if !httpURL.hasSuffix("/") {
+            httpURL += "/"
+        }
+        
+        guard let infoURL = URL(string: httpURL) else { return }
+        
+        do {
+            // Create request with Accept header for NIP-11
+            var request = URLRequest(url: infoURL)
+            request.setValue("application/nostr+json", forHTTPHeaderField: "Accept")
+            request.timeoutInterval = 10.0
+            
+            let (data, response) = try await URLSession.shared.data(for: request)
+            
+            // Check response
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200 else {
+                print("[RelayPool] Failed to fetch relay information from \(url)")
+                return
+            }
+            
+            // Decode relay information
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            let relayInfo = try decoder.decode(RelayInformation.self, from: data)
+            
+            // Update relay with information
+            relay.info = relayInfo
+            relays[url] = relay
+            
+            print("[RelayPool] Fetched relay information for \(url): \(relayInfo.name ?? "Unknown")")
+            
+        } catch {
+            print("[RelayPool] Error fetching relay information from \(url): \(error)")
+        }
     }
     
     private enum HealthEvent {

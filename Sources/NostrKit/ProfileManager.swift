@@ -312,6 +312,42 @@ public actor ProfileManager {
             case word(String)
             case emoji(shortcode: String, url: String)
             case community(id: String, relay: String?)
+            
+            /// Initialize from a tag array
+            init?(fromTag tag: [String]) {
+                guard tag.count >= 2 else { return nil }
+                
+                switch tag[0] {
+                case "p":
+                    let relay = tag.count > 2 ? tag[2] : nil
+                    let petname = tag.count > 3 ? tag[3] : nil
+                    self = .pubkey(tag[1], relay: relay, petname: petname)
+                    
+                case "e":
+                    let relay = tag.count > 2 ? tag[2] : nil
+                    self = .event(tag[1], relay: relay)
+                    
+                case "t":
+                    self = .hashtag(tag[1])
+                    
+                case "r":
+                    self = .relay(tag[1])
+                    
+                case "word":
+                    self = .word(tag[1])
+                    
+                case "emoji":
+                    guard tag.count >= 3 else { return nil }
+                    self = .emoji(shortcode: tag[1], url: tag[2])
+                    
+                case "a":
+                    let relay = tag.count > 2 ? tag[2] : nil
+                    self = .community(id: tag[1], relay: relay)
+                    
+                default:
+                    return nil
+                }
+            }
         }
         
         public init(
@@ -792,8 +828,57 @@ public actor ProfileManager {
             }
         }
         
-        // Create content (empty for now, could be used for encrypted lists)
-        let content = ""
+        // Create content - encrypt items if requested
+        var content = ""
+        if encrypted {
+            // Encrypt all items using NIP-04 (self-encrypted)
+            do {
+                var tags = items.map { item -> [String] in
+                    switch item {
+                    case .pubkey(let pubkey, let relay, let petname):
+                        var tag = ["p", pubkey]
+                        if let relay = relay { tag.append(relay) }
+                        if let petname = petname {
+                            if relay == nil { tag.append("") }
+                            tag.append(petname)
+                        }
+                        return tag
+                    case .event(let eventId, let relay):
+                        var tag = ["e", eventId]
+                        if let relay = relay { tag.append(relay) }
+                        return tag
+                    case .hashtag(let hashtag):
+                        return ["t", hashtag]
+                    case .relay(let url):
+                        return ["r", url]
+                    case .word(let word):
+                        return ["word", word]
+                    case .emoji(let shortcode, let url):
+                        return ["emoji", shortcode, url]
+                    case .community(let id, let relay):
+                        var tag = ["a", id]
+                        if let relay = relay { tag.append(relay) }
+                        return tag
+                    }
+                }
+                
+                let jsonData = try JSONSerialization.data(withJSONObject: tags)
+                let jsonString = String(data: jsonData, encoding: .utf8)!
+                
+                let sharedSecret = try keyPair.getSharedSecret(with: keyPair.publicKey)
+                content = try NostrCrypto.encryptMessage(jsonString, with: sharedSecret)
+                
+                // Clear items from tags when encrypted
+                tags = tags.filter { tag in
+                    guard let first = tag.first else { return true }
+                    return !["p", "e", "t", "r", "word", "emoji", "a"].contains(first)
+                }
+            } catch {
+                // If encryption fails, fall back to public list
+                print("[ProfileManager] Failed to encrypt list items: \(error)")
+                content = ""
+            }
+        }
         
         // Create event
         var event = NostrEvent(
@@ -931,13 +1016,66 @@ public actor ProfileManager {
     
     // MARK: - Private Methods
     
+    /// Decrypts list items from an encrypted list
+    /// - Parameters:
+    ///   - list: The encrypted list
+    ///   - keyPair: Key pair to use for decryption
+    /// - Returns: Decrypted list items
+    public func decryptListItems(
+        from list: UserList,
+        using keyPair: KeyPair
+    ) async throws -> [UserList.ListItem] {
+        guard list.encrypted else {
+            return list.items
+        }
+        
+        // Find the event content
+        let filter = Filter(
+            authors: [list.pubkey],
+            kinds: [list.type.eventKind],
+            limit: 1
+        )
+        
+        let events = try await relayPool.subscribe(
+            filters: [filter],
+            timeout: 5.0
+        )
+        
+        guard let event = events.first,
+              !event.content.isEmpty else {
+            return list.items // Return public items only
+        }
+        
+        // Decrypt content
+        let sharedSecret = try keyPair.getSharedSecret(with: keyPair.publicKey)
+        let decrypted = try NostrCrypto.decryptMessage(event.content, with: sharedSecret)
+        
+        // Parse decrypted JSON
+        guard let data = decrypted.data(using: .utf8),
+              let tags = try? JSONSerialization.jsonObject(with: data) as? [[String]] else {
+            throw NostrError.serializationError(type: "list items", reason: "Failed to parse decrypted content")
+        }
+        
+        // Convert tags to ListItems
+        var items = list.items // Start with public items
+        for tag in tags {
+            if let item = UserList.ListItem(fromTag: tag) {
+                items.append(item)
+            }
+        }
+        
+        return items
+    }
+    
     private func parseUserList(
         from event: NostrEvent,
         type: ListType
     ) throws -> UserList {
         var items: [UserList.ListItem] = []
         var name: String?
+        var isEncrypted = false
         
+        // Parse public items from tags
         for tag in event.tags {
             guard tag.count >= 2 else { continue }
             
@@ -980,12 +1118,20 @@ public actor ProfileManager {
             }
         }
         
+        // Check if there's encrypted content
+        if !event.content.isEmpty {
+            isEncrypted = true
+            // Note: Decryption would require async operation and access to keyStore
+            // which is not available in this sync method. The encrypted content
+            // will need to be decrypted separately when needed.
+        }
+        
         return UserList(
             type: type,
             pubkey: event.pubkey,
             name: name,
             items: items,
-            encrypted: false, // TODO: Implement encrypted lists
+            encrypted: isEncrypted,
             lastUpdated: Date(timeIntervalSince1970: TimeInterval(event.createdAt))
         )
     }
@@ -1059,18 +1205,68 @@ extension ProfileManager {
         for event in events {
             // Extract badge definition reference
             guard let badgeTag = event.tags.first(where: { $0.count >= 2 && $0[0] == "a" }),
-                  let pTag = event.tags.first(where: { $0.count >= 2 && $0[0] == "p" && $0[1] == pubkey }) else {
+                  event.tags.first(where: { $0.count >= 2 && $0[0] == "p" && $0[1] == pubkey }) != nil else {
                 continue
             }
             
             let badgeId = badgeTag[1]
             
-            // TODO: Fetch badge definition event (kind 30009)
-            // For now, create a simple badge
-            let badge = Badge(
-                id: badgeId,
-                name: "Badge"
+            // Parse badge identifier components (kind:pubkey:d-tag)
+            let badgeComponents = badgeId.split(separator: ":").map(String.init)
+            guard badgeComponents.count >= 3 else { continue }
+            
+            let badgePubkey = badgeComponents[1]
+            let badgeDTag = badgeComponents[2]
+            
+            // Fetch badge definition event (kind 30009)
+            let badgeFilter = Filter(
+                authors: [badgePubkey],
+                kinds: [30009], // Badge definition
+                limit: 100 // Get more and filter by d-tag
             )
+            
+            let badgeEvents = try await relayPool.subscribe(
+                filters: [badgeFilter],
+                timeout: 3.0
+            )
+            
+            // Find matching badge definition by d-tag
+            let badgeDefinition = badgeEvents.first { badgeEvent in
+                badgeEvent.tags.contains { tag in
+                    tag.count >= 2 && tag[0] == "d" && tag[1] == badgeDTag
+                }
+            }
+            
+            let badge: Badge
+            if let definition = badgeDefinition {
+                // Parse badge metadata from content
+                var name = "Badge"
+                var description: String?
+                var image: String?
+                var thumbImage: String?
+                
+                if let data = definition.content.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    name = json["name"] as? String ?? "Badge"
+                    description = json["description"] as? String
+                    image = json["image"] as? String
+                    thumbImage = json["thumb"] as? String
+                }
+                
+                badge = Badge(
+                    id: badgeId,
+                    name: name,
+                    description: description,
+                    image: image,
+                    thumbImage: thumbImage
+                )
+            } else {
+                // Fallback if definition not found
+                badge = Badge(
+                    id: badgeId,
+                    name: "Unknown Badge"
+                )
+            }
             
             let award = BadgeAward(
                 badge: badge,

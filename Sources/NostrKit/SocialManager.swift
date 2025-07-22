@@ -456,10 +456,11 @@ public actor SocialManager {
         }
         
         // Create filter for community definition
+        // Since Filter doesn't support d-tag filtering directly,
+        // we need to fetch all community definitions and filter client-side
         let filter = Filter(
             kinds: [34550], // Community definition
-            limit: 1
-            // TODO: Need to handle d-tags differently
+            limit: 100 // Get more events and filter client-side
         )
         
         // Subscribe to get community
@@ -468,7 +469,14 @@ public actor SocialManager {
             timeout: 5.0
         )
         
-        guard let event = events.first,
+        // Filter events client-side to find the one with matching d-tag
+        let matchingEvent = events.first { event in
+            event.tags.contains { tag in
+                tag.count >= 2 && tag[0] == "d" && tag[1] == communityId
+            }
+        }
+        
+        guard let event = matchingEvent,
               let community = Community(from: event) else {
             throw NostrError.notFound(resource: "Community \(communityId)")
         }
