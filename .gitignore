@@ -10,3 +10,4 @@ DerivedData/
 # LLMs
 Claude.MD
 claude/
+.claude/

@@ -6,10 +6,10 @@ let package = Package(
     name: "NostrKit",
     platforms: [
         .macOS(.v15),
-        .iOS(.v13),
-        .tvOS(.v13),
-        .watchOS(.v6),
-        .macCatalyst(.v13)
+        .iOS(.v17),
+        .tvOS(.v17),
+        .watchOS(.v10),
+        .macCatalyst(.v17)
     ],
     products: [
         .library(
@@ -17,7 +17,8 @@ let package = Package(
             targets: ["NostrKit"]),
     ],
     dependencies: [
-        .package(url: "git@github.com:SparrowTek/CoreNostr.git", branch: "main"),
+//        .package(url: "git@github.com:SparrowTek/CoreNostr.git", branch: "main"),
+        .package(path: "../CoreNostr"),
     ],
     targets: [
         .target(
