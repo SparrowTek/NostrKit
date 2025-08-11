@@ -190,14 +190,10 @@ public actor SecureKeyStore {
         }
         
         // Store private key with appropriate security
-        let access = permissions.requiresBiometrics 
-            ? String(kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String)
-            : String(kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String)
-        
         try await keychain.save(
             keyPair.privateKey,
             forKey: privateKeyKey,
-            withAccess: access
+            requiresBiometrics: permissions.requiresBiometrics
         )
         
         // Store public key (less sensitive, can be accessed more easily)
@@ -243,10 +239,31 @@ public actor SecureKeyStore {
         // Retrieve private key
         let privateKeyKey = "\(identityPrefix).\(identity).private"
         let nsec: String
-        do {
-            nsec = try await keychain.loadString(key: privateKeyKey)
-        } catch {
-            throw KeyStoreError.identityNotFound(identity)
+        
+        // If biometrics are required, create a context for authentication
+        if permissions.requiresBiometrics || authenticationRequired {
+            do {
+                let context = try await keychain.createBiometricContext(
+                    reason: "Authenticate to access your Nostr identity"
+                )
+                nsec = try await keychain.loadString(key: privateKeyKey, context: context)
+            } catch {
+                if let keychainError = error as? KeychainWrapper.KeychainError {
+                    switch keychainError {
+                    case .noData:
+                        throw KeyStoreError.identityNotFound(identity)
+                    default:
+                        throw KeyStoreError.biometricsNotAvailable
+                    }
+                }
+                throw KeyStoreError.identityNotFound(identity)
+            }
+        } else {
+            do {
+                nsec = try await keychain.loadString(key: privateKeyKey)
+            } catch {
+                throw KeyStoreError.identityNotFound(identity)
+            }
         }
         
         // Update last used timestamp

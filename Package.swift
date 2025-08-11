@@ -19,12 +19,14 @@ let package = Package(
     dependencies: [
 //        .package(url: "git@github.com:SparrowTek/CoreNostr.git", branch: "main"),
         .package(path: "../CoreNostr"),
+        .package(url: "https://github.com/krzyzanowskim/CryptoSwift.git", from: "1.8.3")
     ],
     targets: [
         .target(
             name: "NostrKit",
             dependencies: [
-                "CoreNostr"
+                "CoreNostr",
+                "CryptoSwift"
             ]),
         .testTarget(
             name: "NostrKitTests",

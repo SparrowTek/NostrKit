@@ -86,7 +86,7 @@ public actor RelayDiscovery {
     private var discoveredRelays: [String: DiscoveredRelay] = [:]
     
     /// Cache of user relay lists (NIP-65)
-    private var userRelayLists: [String: RelayListMetadata] = [:]
+    private var userRelayLists: [String: CoreNostr.RelayListMetadata] = [:]
     
     // MARK: - Public Methods
     
@@ -119,7 +119,32 @@ public actor RelayDiscovery {
         
         for await event in await subscription.events {
             if event.kind == EventKind.relayList.rawValue {
-                let relayList = RelayListMetadata(relays: [])
+                // Parse relay list from event tags (NIP-65)
+                var relays: [CoreNostr.RelayPreference] = []
+                
+                for tag in event.tags {
+                    if tag.name == "r" && !tag.values.isEmpty {
+                        let url = tag.values[0]
+                        let usage: CoreNostr.RelayUsage
+                        
+                        if tag.values.count > 1 {
+                            switch tag.values[1].lowercased() {
+                            case "read":
+                                usage = .read
+                            case "write":
+                                usage = .write
+                            default:
+                                usage = .readWrite
+                            }
+                        } else {
+                            usage = .readWrite
+                        }
+                        
+                        relays.append(CoreNostr.RelayPreference(url: url, usage: usage))
+                    }
+                }
+                
+                let relayList = CoreNostr.RelayListMetadata(relays: relays)
                 userRelayLists[pubkey] = relayList
                 discoveredRelays = relaysFromMetadata(relayList, source: .nip65, recommendedBy: [pubkey])
                 foundRelayList = true
@@ -159,7 +184,32 @@ public actor RelayDiscovery {
         for await event in await subscription.events {
             guard event.kind == EventKind.relayList.rawValue else { continue }
             
-            let relayList = RelayListMetadata(relays: [])
+            // Parse relay list from event tags (NIP-65)
+            var relays: [CoreNostr.RelayPreference] = []
+            
+            for tag in event.tags {
+                if tag.name == "r" && !tag.values.isEmpty {
+                    let url = tag.values[0]
+                    let usage: CoreNostr.RelayUsage
+                    
+                    if tag.values.count > 1 {
+                        switch tag.values[1].lowercased() {
+                        case "read":
+                            usage = .read
+                        case "write":
+                            usage = .write
+                        default:
+                            usage = .readWrite
+                        }
+                    } else {
+                        usage = .readWrite
+                    }
+                    
+                    relays.append(CoreNostr.RelayPreference(url: url, usage: usage))
+                }
+            }
+            
+            let relayList = CoreNostr.RelayListMetadata(relays: relays)
             userRelayLists[event.pubkey] = relayList
             
             // Process each relay in the list
@@ -257,14 +307,14 @@ public actor RelayDiscovery {
     /// Gets cached relay list for a user
     /// - Parameter pubkey: The user's public key
     /// - Returns: The cached relay list metadata if available
-    public func getCachedRelayList(for pubkey: PublicKey) -> RelayListMetadata? {
+    public func getCachedRelayList(for pubkey: PublicKey) -> CoreNostr.RelayListMetadata? {
         userRelayLists[pubkey]
     }
     
     // MARK: - Private Methods
     
     private func relaysFromMetadata(
-        _ metadata: RelayListMetadata,
+        _ metadata: CoreNostr.RelayListMetadata,
         source: DiscoverySource,
         recommendedBy: [String]?
     ) -> [DiscoveredRelay] {

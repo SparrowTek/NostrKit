@@ -150,15 +150,26 @@ public actor RelayService {
         stream != nil
     }
     
+    /// Statistics for monitoring performance
+    private var droppedMessageCount: Int = 0
+    private var totalMessagesReceived: Int = 0
+    
+    /// Returns statistics about the relay connection
+    public var statistics: (received: Int, dropped: Int) {
+        (totalMessagesReceived, droppedMessageCount)
+    }
+    
     // MARK: - Initialization
     
     /// Creates a new relay service for the specified URL
-    /// - Parameter url: The WebSocket URL of the relay
-    public init(url: String) {
+    /// - Parameters:
+    ///   - url: The WebSocket URL of the relay
+    ///   - bufferSize: Maximum number of messages to buffer (default: 100)
+    public init(url: String, bufferSize: Int = 100) {
         self.url = url
         
         var continuation: AsyncStream<RelayMessage>.Continuation?
-        self.messages = AsyncStream { cont in
+        self.messages = AsyncStream(bufferingPolicy: .bufferingNewest(bufferSize)) { cont in
             continuation = cont
         }
         self.messageContinuation = continuation
@@ -270,13 +281,18 @@ public actor RelayService {
         case .string(let text):
             do {
                 let relayMessage = try RelayMessage.decode(from: text)
+                totalMessagesReceived += 1
                 
                 // Handle authentication challenges
                 if case .auth(let challenge) = relayMessage {
                     await handleAuthChallenge(challenge)
                 }
                 
-                messageContinuation?.yield(relayMessage)
+                // Yield to stream - AsyncStream with bufferingNewest will drop old messages if buffer is full
+                let result = messageContinuation?.yield(relayMessage)
+                if result == .dropped {
+                    droppedMessageCount += 1
+                }
                 
             } catch {
                 print("[RelayService] Failed to decode message: \(error)")

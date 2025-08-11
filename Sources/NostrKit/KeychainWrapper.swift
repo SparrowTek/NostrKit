@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import LocalAuthentication
 
 /// A simple wrapper around iOS Keychain Services for secure storage.
 actor KeychainWrapper {
@@ -31,14 +32,33 @@ actor KeychainWrapper {
     }
     
     /// Saves data to the keychain
-    func save(_ data: Data, forKey key: String, withAccess access: String = String(kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String)) throws {
-        let query: [String: Any] = [
+    func save(_ data: Data, forKey key: String, requiresBiometrics: Bool = false) throws {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: access as CFString
+            kSecValueData as String: data
         ]
+        
+        if requiresBiometrics {
+            // Create access control with biometric requirement
+            var accessError: Unmanaged<CFError>?
+            guard let accessControl = SecAccessControlCreateWithFlags(
+                kCFAllocatorDefault,
+                kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                .biometryCurrentSet,
+                &accessError
+            ) else {
+                if let error = accessError?.takeRetainedValue() {
+                    throw KeychainError.unhandledError(status: CFErrorGetCode(error))
+                }
+                throw KeychainError.unhandledError(status: errSecParam)
+            }
+            query[kSecAttrAccessControl as String] = accessControl
+        } else {
+            // Use standard accessibility without biometrics
+            query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        }
         
         // First try to delete any existing item
         SecItemDelete(query as CFDictionary)
@@ -52,22 +72,27 @@ actor KeychainWrapper {
     }
     
     /// Saves a string to the keychain
-    func save(_ string: String, forKey key: String, withAccess access: String = String(kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String)) throws {
+    func save(_ string: String, forKey key: String, requiresBiometrics: Bool = false) throws {
         guard let data = string.data(using: .utf8) else {
             throw KeychainError.unexpectedData
         }
-        try save(data, forKey: key, withAccess: access)
+        try save(data, forKey: key, requiresBiometrics: requiresBiometrics)
     }
     
     /// Loads data from the keychain
-    func load(key: String) throws -> Data {
-        let query: [String: Any] = [
+    func load(key: String, context: LAContext? = nil) throws -> Data {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
+        
+        // If a context is provided, use it for biometric authentication
+        if let context = context {
+            query[kSecUseAuthenticationContext as String] = context
+        }
         
         var dataTypeRef: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &dataTypeRef)
@@ -87,8 +112,8 @@ actor KeychainWrapper {
     }
     
     /// Loads a string from the keychain
-    func loadString(key: String) throws -> String {
-        let data = try load(key: key)
+    func loadString(key: String, context: LAContext? = nil) throws -> String {
+        let data = try load(key: key, context: context)
         guard let string = String(data: data, encoding: .utf8) else {
             throw KeychainError.unexpectedData
         }
@@ -150,7 +175,34 @@ actor KeychainWrapper {
         var error: NSError?
         return context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
     }
+    
+    /// Creates an LAContext for biometric authentication
+    func createBiometricContext(reason: String) async throws -> LAContext {
+        let context = LAContext()
+        
+        // Check if biometrics are available
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+            if let error = error {
+                throw KeychainError.unhandledError(status: OSStatus(error.code))
+            }
+            throw KeychainError.unhandledError(status: errSecAuthFailed)
+        }
+        
+        // Perform biometric authentication
+        do {
+            let success = try await context.evaluatePolicy(
+                .deviceOwnerAuthenticationWithBiometrics,
+                localizedReason: reason
+            )
+            
+            guard success else {
+                throw KeychainError.unhandledError(status: errSecAuthFailed)
+            }
+            
+            return context
+        } catch let authError as NSError {
+            throw KeychainError.unhandledError(status: OSStatus(authError.code))
+        }
+    }
 }
-
-// Import LocalAuthentication for biometric checks
-import LocalAuthentication
