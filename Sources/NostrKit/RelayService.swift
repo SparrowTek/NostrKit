@@ -290,7 +290,7 @@ public actor RelayService {
                 
                 // Yield to stream - AsyncStream with bufferingNewest will drop old messages if buffer is full
                 let result = messageContinuation?.yield(relayMessage)
-                if result == .dropped {
+                if case .dropped = result {
                     droppedMessageCount += 1
                 }
                 

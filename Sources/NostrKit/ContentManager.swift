@@ -397,7 +397,7 @@ public actor ContentManager {
         try await relayPool.publish(event: event)
         
         // Cache in event cache
-        try? await eventCache.store(event)
+        _ = try? await eventCache.store(event)
         
         return event
     }
@@ -744,7 +744,7 @@ public actor ContentManager {
         )
         
         if let event = events.first {
-            try? await eventCache.store(event)
+            _ = try? await eventCache.store(event)
             return event
         }
         

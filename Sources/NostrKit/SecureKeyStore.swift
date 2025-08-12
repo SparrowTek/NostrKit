@@ -240,13 +240,13 @@ public actor SecureKeyStore {
         let privateKeyKey = "\(identityPrefix).\(identity).private"
         let nsec: String
         
-        // If biometrics are required, create a context for authentication
+        // If biometrics are required, authenticate and load
         if permissions.requiresBiometrics || authenticationRequired {
             do {
-                let context = try await keychain.createBiometricContext(
+                nsec = try await keychain.loadStringWithBiometrics(
+                    key: privateKeyKey,
                     reason: "Authenticate to access your Nostr identity"
                 )
-                nsec = try await keychain.loadString(key: privateKeyKey, context: context)
             } catch {
                 if let keychainError = error as? KeychainWrapper.KeychainError {
                     switch keychainError {

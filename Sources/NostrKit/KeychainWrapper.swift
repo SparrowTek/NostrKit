@@ -50,7 +50,7 @@ actor KeychainWrapper {
                 &accessError
             ) else {
                 if let error = accessError?.takeRetainedValue() {
-                    throw KeychainError.unhandledError(status: CFErrorGetCode(error))
+                    throw KeychainError.unhandledError(status: OSStatus(CFErrorGetCode(error)))
                 }
                 throw KeychainError.unhandledError(status: errSecParam)
             }
@@ -201,6 +201,37 @@ actor KeychainWrapper {
             }
             
             return context
+        } catch let authError as NSError {
+            throw KeychainError.unhandledError(status: OSStatus(authError.code))
+        }
+    }
+    
+    /// Loads a string from the keychain with biometric authentication
+    func loadStringWithBiometrics(key: String, reason: String) async throws -> String {
+        let context = LAContext()
+        
+        // Check if biometrics are available
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+            if let error = error {
+                throw KeychainError.unhandledError(status: OSStatus(error.code))
+            }
+            throw KeychainError.unhandledError(status: errSecAuthFailed)
+        }
+        
+        // Perform biometric authentication
+        do {
+            let success = try await context.evaluatePolicy(
+                .deviceOwnerAuthenticationWithBiometrics,
+                localizedReason: reason
+            )
+            
+            guard success else {
+                throw KeychainError.unhandledError(status: errSecAuthFailed)
+            }
+            
+            // Load the string with the authenticated context
+            return try loadString(key: key, context: context)
         } catch let authError as NSError {
             throw KeychainError.unhandledError(status: OSStatus(authError.code))
         }
