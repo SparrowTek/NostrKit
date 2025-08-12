@@ -1,72 +1,37 @@
 # NostrKit
 
-A Swift implementation of the Nostr protocol, providing a comprehensive SDK for building Nostr applications on Apple platforms.
+iOS-specific NOSTR implementation providing networking, relay management, and high-level features for building NOSTR applications on Apple platforms.
 
 ## Overview
 
-NostrKit is a Swift package that implements the [Nostr protocol](https://github.com/nostr-protocol/nostr) - a simple, open protocol for creating censorship-resistant global social networks. The package is split into two main targets:
+NostrKit implements the iOS-specific components needed for NOSTR applications, including WebSocket connections, relay pool management, secure key storage, and high-level managers for common NOSTR operations. It builds on top of [CoreNostr](../CoreNostr) which provides the platform-agnostic protocol implementation.
 
-- **CoreNostr**: Platform-agnostic core functionality that can be shared across all platforms
-- **NostrKit**: iOS-specific implementations including WebSocket networking and relay management
+## Key Features
 
-## Features
+### 🌐 Relay Management
+- **RelayService**: WebSocket-based relay connections with automatic reconnection
+- **RelayPool**: Connection pooling with health monitoring and load balancing
+- **RelayDiscovery**: NIP-65 relay discovery and bootstrap relay configuration
+- **SubscriptionManager**: Event deduplication and subscription lifecycle management
 
-### Core Protocol Support
-- ✅ **NIP-01**: Basic protocol flow (events, signatures, subscriptions)
-- ✅ **NIP-02**: Contact lists and petnames
-- ✅ **NIP-04**: Encrypted direct messages
-- ✅ **NIP-05**: DNS-based internet identifiers
-- ✅ **NIP-06**: Basic key derivation from mnemonic seed phrase
-- ✅ **NIP-09**: Event deletion
-- ✅ **NIP-10**: Reply threading conventions
-- ✅ **NIP-11**: Relay information document
-- ✅ **NIP-13**: Proof of work
-- ✅ **NIP-19**: bech32-encoded entities
-- ✅ **NIP-21**: nostr: URL scheme
-- ✅ **NIP-23**: Long-form content
-- ✅ **NIP-25**: Reactions
-- ✅ **NIP-27**: Text note references
-- ✅ **NIP-42**: Authentication of clients to relays
-- ✅ **NIP-50**: Search capability
-- ✅ **NIP-51**: Lists (mute, pin, bookmarks, communities)
-- ✅ **NIP-57**: Lightning Zaps
-- ✅ **NIP-58**: Badges
-- ✅ **NIP-65**: Relay list metadata
+### 🔐 Security & Storage
+- **SecureKeyStore**: Keychain-based secure key storage with biometric authentication
+- **EncryptionManager**: NIP-04 and NIP-44 message encryption/decryption
+- **EventCache**: LRU memory cache for events with configurable size limits
 
-### Key Components
+### 📱 High-Level Managers
+- **ProfileManager**: User profile fetching, caching, and NIP-05 verification
+- **ContentManager**: Thread reconstruction, article publishing, reactions, and reposts
+- **SocialManager**: Follow lists, communities, notifications, and zap management
 
-#### Event Management
-- Create and sign Nostr events
-- Verify event signatures
-- Serialize/deserialize events
-- Event filtering and matching
-
-#### Cryptography
-- Key pair generation and management
-- Message signing and verification
-- NIP-04 encryption/decryption
-- BIP-39 mnemonic support
-- BIP-32 key derivation
-
-#### Relay Communication
-- WebSocket-based relay connections
-- Connection pooling and management
-- Automatic reconnection
-- Message queuing and delivery
-- NIP-42 authentication support
-
-#### User Experience Features
-- Profile management and NIP-05 verification
-- Content threading and long-form articles
-- Reactions, reposts, and zaps
-- Community/group support
-- Notification handling
+### 🔧 Utilities
+- **QueryBuilder**: Fluent API for constructing NOSTR filters
+- **KeychainWrapper**: iOS keychain integration with biometric support
+- **Network diagnostics**: Connection health monitoring and statistics
 
 ## Installation
 
-### Swift Package Manager
-
-Add NostrKit to your `Package.swift` file:
+Add NostrKit to your iOS project using Swift Package Manager:
 
 ```swift
 dependencies: [
@@ -74,129 +39,162 @@ dependencies: [
 ]
 ```
 
-Or add it through Xcode:
-1. File → Add Package Dependencies
-2. Enter the repository URL: `https://github.com/SparrowTek/NostrKit.git`
-3. Select the version and add to your project
+## Usage Examples
 
-## Usage
-
-### Basic Event Creation
+### Setting Up a Relay Pool
 
 ```swift
 import NostrKit
 import CoreNostr
 
-// Generate a new key pair
-let keyPair = try KeyPair.generate()
+// Create and configure relay pool
+let pool = RelayPool(configuration: .default)
 
-// Create a text note
-let event = try CoreNostr.createTextNote(
-    content: "Hello, Nostr!",
-    keyPair: keyPair
+// Add relays with metadata
+try await pool.addRelay(
+    url: "wss://relay.damus.io",
+    metadata: RelayPool.RelayMetadata(
+        read: true,
+        write: true,
+        isPrimary: true
+    )
 )
 
-// Verify the event
-let isValid = try CoreNostr.verifyEvent(event)
+// Monitor relay health
+await pool.setDelegate(self)
 ```
 
-### Connecting to Relays
+### Secure Key Management
 
 ```swift
-// Create a relay pool
-let pool = RelayPool()
+let keyStore = SecureKeyStore()
 
-// Add relays
-try await pool.addRelay(url: "wss://relay.damus.io")
-try await pool.addRelay(url: "wss://nostr.wine")
-
-// Subscribe to events
-let filter = Filter(
-    kinds: [EventKind.textNote.rawValue],
-    limit: 20
+// Store a key pair with biometric protection
+try await keyStore.store(
+    keyPair,
+    for: "main-identity",
+    name: "My Nostr Identity",
+    permissions: .biometricRequired
 )
 
-await pool.subscribe(id: "my-subscription", filters: [filter])
-
-// Listen for events
-for await (relay, message) in pool.messages {
-    switch message {
-    case .event(let subId, let event):
-        print("New event from \(relay): \(event.content)")
-    case .eose(let subId):
-        print("End of stored events for subscription: \(subId)")
-    default:
-        break
-    }
-}
+// Retrieve with authentication
+let keyPair = try await keyStore.retrieve(
+    identity: "main-identity",
+    authenticationRequired: true
+)
 ```
 
-### Profile Management
+### Publishing Content
 
 ```swift
-let profileManager = ProfileManager(cacheManager: cacheManager, relayPool: pool)
+let contentManager = ContentManager(
+    relayPool: pool,
+    eventCache: eventCache,
+    keyStore: keyStore
+)
 
-// Fetch user metadata
-let metadata = try await profileManager.fetchMetadata(for: publicKey)
+// Publish an article (NIP-23)
+let article = try await contentManager.publishArticle(
+    title: "My First Article",
+    content: markdownContent,
+    summary: "A brief summary",
+    tags: ["nostr", "tutorial"],
+    using: "main-identity"
+)
 
-// Verify NIP-05 identifier
-let verification = try await profileManager.verifyNIP05(
-    identifier: "alice@example.com",
-    pubkey: publicKey
+// Create a reply with proper threading (NIP-10)
+let reply = try await contentManager.reply(
+    to: parentEventId,
+    content: "Great post!",
+    using: "main-identity"
 )
 ```
 
-### Content Operations
-
-```swift
-let contentManager = ContentManager(relayPool: pool, cacheManager: cacheManager)
-
-// Reconstruct a thread
-let thread = try await contentManager.reconstructThread(for: eventId)
-
-// Create a reaction
-let reaction = try await contentManager.createReaction(
-    to: eventId,
-    content: "👍",
-    using: "my-identity"
-)
-```
-
-### Lightning Zaps
+### Managing Social Features
 
 ```swift
 let socialManager = SocialManager(
     relayPool: pool,
-    cacheManager: cacheManager,
-    identityManager: identityManager
+    eventCache: eventCache
 )
 
-// Create a zap request
+// Update follow list
+try await socialManager.updateFollowList(
+    adding: [newFollowPubkey],
+    removing: [],
+    using: "main-identity"
+)
+
+// Create a zap request (NIP-57)
 let zapRequest = try await socialManager.createZapRequest(
     to: recipientPubkey,
-    amount: 1000, // satoshis
-    comment: "Great post!",
-    eventId: eventId,
-    using: "my-identity"
+    amount: 1000,
+    comment: "Thanks for the great content!",
+    using: "main-identity"
 )
+```
+
+### Event Subscriptions
+
+```swift
+// Build a complex filter
+let filter = QueryBuilder()
+    .authors(["pubkey1", "pubkey2"])
+    .kinds([.textNote, .longFormContent])
+    .since(Date().addingTimeInterval(-86400))
+    .tag("t", values: ["nostr", "bitcoin"])
+    .limit(100)
+    .build()
+
+// Subscribe and process events
+let subscription = try await pool.subscribe(filters: [filter])
+
+for await event in subscription.events {
+    print("Received: \(event.content)")
+}
 ```
 
 ## Architecture
 
-### CoreNostr (Platform-agnostic)
-- Event models and serialization
-- Cryptographic operations
-- Protocol message types
-- Filters and subscriptions
-- NIP implementations
+### Core Components
 
-### NostrKit (iOS-specific)
-- WebSocket relay connections
-- Relay pool management
-- Profile management
-- Content management
-- Social features
-- Caching and persistence
+- **RelayService**: Individual relay connection management
+- **RelayPool**: Coordinates multiple relay connections
+- **EventCache**: In-memory event storage with LRU eviction
+- **SecureKeyStore**: Keychain-based identity management
+
+### Manager Layer
+
+- **ProfileManager**: User metadata and NIP-05 verification
+- **ContentManager**: Content creation, threading, and interactions
+- **SocialManager**: Social graph and community features
+- **EncryptionManager**: Message encryption/decryption
+
+### Supporting Types
+
+- **SubscriptionManager**: Manages active subscriptions
+- **RelayDiscovery**: Discovers relays via NIP-65
+- **QueryBuilder**: Filter construction helper
+
+## Testing
+
+NostrKit includes comprehensive test coverage:
+
+```bash
+# Run all tests
+swift test
+
+# Run unit tests only
+swift test --filter NostrKitUnitTests
+
+# Run integration tests (requires network)
+swift test --filter RelayIntegrationTests
+```
+
+### Test Categories
+- **Unit Tests**: Test individual components without network
+- **Integration Tests**: Test real relay connections
+- **Performance Tests**: Verify message handling at scale
 
 ## Requirements
 
@@ -206,36 +204,27 @@ let zapRequest = try await socialManager.createZapRequest(
 
 ## Dependencies
 
-- [swift-secp256k1](https://github.com/21-DOT-DEV/swift-secp256k1) - Cryptographic operations
-- [swift-crypto](https://github.com/apple/swift-crypto) - Additional cryptography
-- [CryptoSwift](https://github.com/krzyzanowskim/CryptoSwift) - AES encryption
-- [BigInt](https://github.com/attaswift/BigInt) - Large number operations
-- [SwiftCBOR](https://github.com/valpackett/SwiftCBOR) - CBOR encoding/decoding
-- [Vault](https://github.com/SparrowTek/Vault) - Keychain management
+NostrKit leverages:
+- **CoreNostr**: Platform-agnostic NOSTR protocol implementation
+- **LocalAuthentication**: Biometric authentication
+- **Foundation.URLSession**: WebSocket connections
 
-## Testing
-
-The project includes comprehensive test suites:
-
-```bash
-# Run all tests
-swift test
-
-# Run specific test suite
-swift test --filter CoreNostrTests
-swift test --filter NostrKitTests
-```
+See [Package.swift](Package.swift) for the complete dependency list.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues and pull requests.
+Contributions are welcome! Please:
+1. Follow existing code patterns and Swift conventions
+2. Add tests for new functionality
+3. Update documentation as needed
+4. Ensure all tests pass before submitting PRs
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT License - see [LICENSE](LICENSE) file for details.
 
-## Acknowledgments
+## Related Projects
 
-- The [Nostr Protocol](https://github.com/nostr-protocol/nostr) community
-- [rust-nostr](https://github.com/rust-nostr/nostr) for inspiration
-- All the NIP authors and contributors
+- [CoreNostr](../CoreNostr): Platform-agnostic NOSTR implementation
+- [NOSTR Protocol](https://github.com/nostr-protocol/nostr): Protocol specification
+- [NIPs](https://github.com/nostr-protocol/nips): NOSTR Implementation Possibilities
