@@ -62,7 +62,7 @@ struct RelayIntegrationTests {
         @Test("Send event to relay", .timeLimit(.minutes(1)))
         func testSendEvent() async throws {
             let relay = RelayService(url: "wss://relay.damus.io")
-            let keyPair = try KeyPair.generate()
+            let keyPair = try CoreNostr.createKeyPair()
             
             let event = try CoreNostr.createTextNote(
                 keyPair: keyPair,
@@ -288,7 +288,7 @@ struct RelayIntegrationTests {
         @Test("Send multiple events rapidly", .timeLimit(.minutes(2)))
         func testRapidEventSending() async throws {
             let relay = RelayService(url: "wss://relay.damus.io")
-            let keyPair = try KeyPair.generate()
+            let keyPair = try CoreNostr.createKeyPair()
             
             try await relay.connect()
             

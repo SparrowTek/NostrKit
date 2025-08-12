@@ -4,7 +4,7 @@ import CoreNostr
 
 protocol RelayServiceProtocol: Actor {
     var url: URL { get }
-    var state: RelayConnectionState { get }
+    var state: NostrKit.RelayPool.ConnectionState { get }
     func connect() async throws
     func disconnect() async
     func send(_ message: ClientMessage) async throws
@@ -14,7 +14,7 @@ protocol RelayServiceProtocol: Actor {
 
 actor MockRelayService: RelayServiceProtocol {
     let url: URL
-    private(set) var state: RelayConnectionState = .disconnected
+    private(set) var state: NostrKit.RelayPool.ConnectionState = .disconnected
     private var mockResponses: [String: [RelayMessage]] = [:]
     private var mockEvents: [NostrEvent] = []
     private var shouldFailConnection = false
@@ -92,20 +92,6 @@ actor MockRelayService: RelayServiceProtocol {
             
         case .close(let subscriptionId):
             mockResponses.removeValue(forKey: subscriptionId)
-            
-        case .auth(_):
-            // Handle auth if needed
-            break
-            
-        case .count(let subscriptionId, let filters):
-            // Simulate count response
-            let count = mockEvents.filter { event in
-                matchesAnyFilter(event: event, filters: filters)
-            }.count
-            
-            mockResponses[subscriptionId] = [
-                .count(subscriptionId: subscriptionId, count: count)
-            ]
         }
     }
     
@@ -141,7 +127,7 @@ actor MockRelayService: RelayServiceProtocol {
             
             // Check kinds
             if let kinds = filter.kinds, !kinds.isEmpty {
-                if !kinds.contains(event.kind.rawValue) {
+                if !kinds.contains(event.kind) {
                     continue
                 }
             }
@@ -159,20 +145,24 @@ actor MockRelayService: RelayServiceProtocol {
                 }
             }
             
-            // Check tags
-            if let tags = filter.tags {
-                var allTagsMatch = true
-                for (tagName, tagValues) in tags {
-                    let eventTagValues = event.tags
-                        .filter { $0.name == tagName }
-                        .flatMap { $0.values }
-                    
-                    if !tagValues.contains(where: { eventTagValues.contains($0) }) {
-                        allTagsMatch = false
-                        break
-                    }
+            // Check e tags (event references)
+            if let eventIds = filter.e, !eventIds.isEmpty {
+                let referencedEvents = event.tags
+                    .filter { $0.count >= 2 && $0[0] == "e" }
+                    .map { $0[1] }
+                
+                if !eventIds.contains(where: { referencedEvents.contains($0) }) {
+                    continue
                 }
-                if !allTagsMatch {
+            }
+            
+            // Check p tags (pubkey references)
+            if let pubkeys = filter.p, !pubkeys.isEmpty {
+                let referencedPubkeys = event.tags
+                    .filter { $0.count >= 2 && $0[0] == "p" }
+                    .map { $0[1] }
+                
+                if !pubkeys.contains(where: { referencedPubkeys.contains($0) }) {
                     continue
                 }
             }
