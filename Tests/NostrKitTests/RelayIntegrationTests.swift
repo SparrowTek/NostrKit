@@ -225,20 +225,6 @@ struct RelayIntegrationTests {
             
             try await relay.connect()
             
-            var receivedNotice = false
-            var noticeMessage: String?
-            
-            // Set up message handler
-            Task {
-                for await message in await relay.messages {
-                    if case let .notice(msg) = message {
-                        receivedNotice = true
-                        noticeMessage = msg
-                        break
-                    }
-                }
-            }
-            
             // Try to subscribe with an invalid filter that might trigger a notice
             // Using empty subscription ID which some relays reject
             do {
