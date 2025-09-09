@@ -385,7 +385,7 @@ public actor EventCache {
     private func removeById(_ id: String) async -> Bool {
         guard let cached = memoryCache.removeValue(forKey: id) else {
             // Try disk storage
-            if let diskStorage = diskStorage {
+            if let diskStorage {
                 return (try? await diskStorage.delete(eventId: id)) ?? false
             }
             return false
@@ -398,8 +398,8 @@ public actor EventCache {
         lruOrder.removeAll { $0 == id }
         
         // Remove from disk
-        if let diskStorage = diskStorage {
-            try? await diskStorage.delete(eventId: id)
+        if let diskStorage {
+            _ = try? await diskStorage.delete(eventId: id)
         }
         
         return true
