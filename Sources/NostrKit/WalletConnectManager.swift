@@ -9,21 +9,109 @@ import Foundation
 import CoreNostr
 import Combine
 
-/// Manages Nostr Wallet Connect (NIP-47) connections and operations
+/// Manages Lightning wallet connections using the Nostr Wallet Connect protocol (NIP-47).
+///
+/// `WalletConnectManager` provides a complete interface for integrating Lightning payments
+/// into your Nostr application. It handles connection management, payment operations,
+/// and real-time notifications from wallet services.
+///
+/// ## Overview
+///
+/// The manager maintains persistent connections to NWC-compatible wallet services through
+/// Nostr relays, enabling seamless Lightning Network integration. All connections are
+/// stored securely in the iOS Keychain and automatically restored on app launch.
+///
+/// ### Key Features
+/// - Multiple wallet connection management
+/// - Secure connection storage in Keychain
+/// - Real-time payment notifications
+/// - Automatic reconnection handling
+/// - Support for both NIP-04 and NIP-44 encryption
+///
+/// ## Example Usage
+///
+/// ```swift
+/// @StateObject private var walletManager = WalletConnectManager()
+///
+/// // Connect to a wallet
+/// try await walletManager.connect(
+///     uri: "nostr+walletconnect://pubkey?relay=wss://relay.com&secret=..."
+/// )
+///
+/// // Pay an invoice
+/// let result = try await walletManager.payInvoice("lnbc1000n1...")
+/// print("Payment completed with preimage: \(result.preimage)")
+///
+/// // Check balance
+/// let balance = try await walletManager.getBalance()
+/// print("Balance: \(balance) millisats")
+/// ```
+///
+/// ## Topics
+///
+/// ### Essentials
+/// - ``connect(uri:alias:)``
+/// - ``disconnect()``
+/// - ``payInvoice(_:amount:)``
+/// - ``getBalance()``
+///
+/// ### Connection Management
+/// - ``connections``
+/// - ``activeConnection``
+/// - ``connectionState``
+/// - ``switchConnection(to:)``
+/// - ``removeConnection(_:)``
+/// - ``reconnect()``
+///
+/// ### Payment Operations
+/// - ``makeInvoice(amount:description:expiry:)``
+/// - ``listTransactions(from:until:limit:)``
+///
+/// ### State Observation
+/// - ``balance``
+/// - ``recentTransactions``
+/// - ``isLoading``
+/// - ``lastError``
+///
+/// ### Utility Methods
+/// - ``supportsMethod(_:)``
+/// - ``supportsNotifications``
+/// - ``preferredEncryption``
 @MainActor
 public class WalletConnectManager: ObservableObject {
     
     // MARK: - Types
     
-    /// Represents a wallet connection
+    /// Represents a persistent wallet connection with its metadata and capabilities.
+    ///
+    /// Each connection stores the NWC URI components and tracks usage statistics.
+    /// Connections are automatically persisted to the Keychain for secure storage.
     public struct WalletConnection: Codable, Identifiable {
+        /// Unique identifier for this connection.
         public let id: String
+        
+        /// The parsed NWC connection URI containing wallet pubkey, relays, and secret.
         public let uri: NWCConnectionURI
+        
+        /// Optional human-readable alias for this wallet connection.
         public let alias: String?
+        
+        /// Timestamp when this connection was first established.
         public let createdAt: Date
+        
+        /// Timestamp of the most recent successful operation with this wallet.
         public var lastUsedAt: Date?
+        
+        /// Wallet capabilities including supported methods and encryption schemes.
+        ///
+        /// This is populated by querying the wallet's info event (kind 13194) after connection.
         public var capabilities: NWCInfo?
         
+        /// Creates a new wallet connection.
+        ///
+        /// - Parameters:
+        ///   - uri: The parsed NWC connection URI
+        ///   - alias: Optional human-readable name for this connection
         public init(uri: NWCConnectionURI, alias: String? = nil) {
             self.id = UUID().uuidString
             self.uri = uri
@@ -32,42 +120,75 @@ public class WalletConnectManager: ObservableObject {
         }
     }
     
-    /// Payment result
+    /// The result of a successful Lightning payment.
+    ///
+    /// Contains the payment proof (preimage) and optional fee information.
     public struct PaymentResult {
+        /// The payment preimage serving as proof of payment.
+        ///
+        /// This 32-byte value is the cryptographic proof that the payment was completed.
         public let preimage: String
+        
+        /// The amount of fees paid in millisatoshis, if reported by the wallet.
         public let feesPaid: Int64?
+        
+        /// The payment hash, if provided by the wallet.
         public let paymentHash: String?
     }
     
-    /// Connection state
+    /// Represents the current state of the wallet connection.
+    ///
+    /// Use this to update your UI based on connection status.
     public enum ConnectionState {
+        /// No active wallet connection.
         case disconnected
+        
+        /// Currently establishing connection to wallet service.
         case connecting
+        
+        /// Successfully connected and ready for operations.
         case connected
+        
+        /// Connection attempt failed with an error.
         case failed(Error)
     }
     
     // MARK: - Published Properties
     
-    /// All stored wallet connections
+    /// All wallet connections stored in the Keychain.
+    ///
+    /// This array persists across app launches and is automatically loaded on initialization.
     @Published public private(set) var connections: [WalletConnection] = []
     
-    /// Currently active connection
+    /// The currently active wallet connection used for payment operations.
+    ///
+    /// Set this to `nil` to disconnect, or use ``switchConnection(to:)`` to change wallets.
     @Published public var activeConnection: WalletConnection?
     
-    /// Current connection state
+    /// The current connection state of the active wallet.
+    ///
+    /// Observe this property to update your UI based on connection status.
     @Published public private(set) var connectionState: ConnectionState = .disconnected
     
-    /// Last known balance in millisats
+    /// The last known wallet balance in millisatoshis.
+    ///
+    /// This value is updated when calling ``getBalance()`` or when receiving payment notifications.
+    /// - Note: 1000 millisats = 1 satoshi
     @Published public private(set) var balance: Int64?
     
-    /// Recent transactions
+    /// Recent transactions fetched from the wallet.
+    ///
+    /// Updated by calling ``listTransactions(from:until:limit:)`` or via notifications.
     @Published public private(set) var recentTransactions: [NWCTransaction] = []
     
-    /// Loading state
+    /// Indicates whether an operation is currently in progress.
+    ///
+    /// Use this to show loading indicators in your UI.
     @Published public private(set) var isLoading = false
     
-    /// Last error
+    /// The most recent error that occurred, if any.
+    ///
+    /// This is set when operations fail and can be used for error reporting.
     @Published public private(set) var lastError: Error?
     
     // MARK: - Private Properties
@@ -87,6 +208,12 @@ public class WalletConnectManager: ObservableObject {
     
     // MARK: - Initialization
     
+    /// Creates a new wallet connect manager instance.
+    ///
+    /// The manager automatically loads any previously saved connections from the Keychain
+    /// on initialization. No manual setup is required.
+    ///
+    /// - Note: The manager must be used on the main actor for SwiftUI compatibility.
     public init() {
         self.keychain = KeychainWrapper(service: Self.keychainService)
         self.relayPool = RelayPool()
@@ -98,7 +225,44 @@ public class WalletConnectManager: ObservableObject {
     
     // MARK: - Connection Management
     
-    /// Connect to a wallet using a NWC URI
+    /// Establishes a connection to a Lightning wallet using a NWC URI.
+    ///
+    /// This method connects to the specified wallet service through the provided relays,
+    /// fetches the wallet's capabilities, and stores the connection securely in the Keychain.
+    /// If this is the first connection, it automatically becomes the active connection.
+    ///
+    /// - Parameters:
+    ///   - uri: A NWC connection URI in the format `nostr+walletconnect://pubkey?relay=...&secret=...`
+    ///   - alias: An optional human-readable name for this wallet connection
+    ///
+    /// - Throws:
+    ///   - ``NWCError`` with code `.other` if the URI is invalid
+    ///   - ``RelayError`` if connection to relays fails
+    ///   - Other network-related errors
+    ///
+    /// - Important: The connection URI contains sensitive information and should be obtained
+    ///   securely from the user's wallet provider.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// do {
+    ///     try await walletManager.connect(
+    ///         uri: "nostr+walletconnect://abc123...?relay=wss://relay.getalby.com/v1&secret=...",
+    ///         alias: "My Alby Wallet"
+    ///     )
+    ///     print("Connected to wallet!")
+    /// } catch {
+    ///     print("Connection failed: \(error)")
+    /// }
+    /// ```
+    ///
+    /// - Note: The connection process includes:
+    ///   1. Parsing and validating the URI
+    ///   2. Connecting to specified relays
+    ///   3. Fetching wallet capabilities
+    ///   4. Storing connection securely
+    ///   5. Subscribing to payment notifications
     public func connect(uri: String, alias: String? = nil) async throws {
         guard let nwcURI = NWCConnectionURI(from: uri) else {
             throw NWCError(code: .other, message: "Invalid NWC URI")
@@ -147,7 +311,21 @@ public class WalletConnectManager: ObservableObject {
         }
     }
     
-    /// Disconnect from the active wallet
+    /// Disconnects from the currently active wallet.
+    ///
+    /// This method closes all active subscriptions, disconnects from relays,
+    /// and clears the active connection. The connection remains stored and can
+    /// be reactivated later using ``reconnect()`` or ``switchConnection(to:)``.
+    ///
+    /// - Note: This does not remove the wallet from stored connections.
+    ///   Use ``removeConnection(_:)`` to permanently remove a wallet.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// await walletManager.disconnect()
+    /// // The wallet is now disconnected but still saved
+    /// ```
     public func disconnect() async {
         connectionState = .disconnected
         
@@ -174,7 +352,22 @@ public class WalletConnectManager: ObservableObject {
         recentTransactions = []
     }
     
-    /// Remove a wallet connection
+    /// Permanently removes a wallet connection from storage.
+    ///
+    /// This removes the connection from the Keychain and disconnects if it's currently active.
+    ///
+    /// - Parameter connection: The wallet connection to remove
+    ///
+    /// - Note: This action cannot be undone. The user will need to re-enter
+    ///   the connection URI to use this wallet again.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// if let walletToRemove = walletManager.connections.first {
+    ///     await walletManager.removeConnection(walletToRemove)
+    /// }
+    /// ```
     public func removeConnection(_ connection: WalletConnection) async {
         connections.removeAll { $0.id == connection.id }
         await saveConnections()
@@ -184,7 +377,24 @@ public class WalletConnectManager: ObservableObject {
         }
     }
     
-    /// Switch to a different wallet connection
+    /// Switches the active wallet to a different stored connection.
+    ///
+    /// This method disconnects from the current wallet (if any) and connects
+    /// to the specified wallet connection.
+    ///
+    /// - Parameter connection: The wallet connection to activate
+    ///
+    /// - Throws:
+    ///   - ``NWCError`` if the connection is not found in stored connections
+    ///   - Connection errors if establishing the new connection fails
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// if let secondWallet = walletManager.connections[1] {
+    ///     try await walletManager.switchConnection(to: secondWallet)
+    /// }
+    /// ```
     public func switchConnection(to connection: WalletConnection) async throws {
         guard connections.contains(where: { $0.id == connection.id }) else {
             throw NWCError(code: .other, message: "Connection not found")
@@ -201,7 +411,25 @@ public class WalletConnectManager: ObservableObject {
         try await reconnect()
     }
     
-    /// Reconnect to the active wallet
+    /// Reconnects to the currently active wallet.
+    ///
+    /// Use this method to re-establish a connection after network issues
+    /// or when returning from background.
+    ///
+    /// - Throws:
+    ///   - ``NWCError`` if no active connection is set
+    ///   - Connection errors if establishing the connection fails
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// // After network recovery
+    /// do {
+    ///     try await walletManager.reconnect()
+    /// } catch {
+    ///     print("Reconnection failed: \(error)")
+    /// }
+    /// ```
     public func reconnect() async throws {
         guard let connection = activeConnection else {
             throw NWCError(code: .other, message: "No active connection")
@@ -232,7 +460,51 @@ public class WalletConnectManager: ObservableObject {
     
     // MARK: - Payment Operations
     
-    /// Pay a lightning invoice
+    /// Pays a Lightning invoice using the connected wallet.
+    ///
+    /// This method sends a payment request to the connected wallet service and waits
+    /// for confirmation. The wallet must have sufficient balance and the invoice must be valid.
+    ///
+    /// - Parameters:
+    ///   - invoice: A BOLT11 Lightning invoice string (e.g., "lnbc1000n1...")
+    ///   - amount: Optional amount override in millisatoshis. Only valid for zero-amount invoices.
+    ///
+    /// - Returns: A ``PaymentResult`` containing the payment preimage and optional fee information.
+    ///
+    /// - Throws:
+    ///   - ``NWCError/insufficientBalance``: The wallet doesn't have enough funds
+    ///   - ``NWCError/paymentFailed``: The payment could not be completed
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    ///   - ``NWCError/rateLimited``: Too many requests in a short time
+    ///
+    /// - Important: Always check the wallet balance before attempting large payments.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// do {
+    ///     let invoice = "lnbc1000n1..." // From recipient
+    ///     let result = try await walletManager.payInvoice(invoice)
+    ///     
+    ///     print("Payment successful!")
+    ///     print("Preimage: \(result.preimage)")
+    ///     
+    ///     if let fees = result.feesPaid {
+    ///         print("Fees: \(fees) millisats")
+    ///     }
+    /// } catch let error as NWCError {
+    ///     switch error.code {
+    ///     case .insufficientBalance:
+    ///         print("Not enough funds")
+    ///     case .paymentFailed:
+    ///         print("Payment failed: \(error.message)")
+    ///     default:
+    ///         print("Error: \(error.message)")
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// - Note: The payment process is atomic - either it completes fully or fails completely.
     public func payInvoice(_ invoice: String, amount: Int64? = nil) async throws -> PaymentResult {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
@@ -290,7 +562,30 @@ public class WalletConnectManager: ObservableObject {
         )
     }
     
-    /// Get wallet balance
+    /// Retrieves the current balance from the connected wallet.
+    ///
+    /// The balance is returned in millisatoshis (1/1000 of a satoshi).
+    ///
+    /// - Returns: The wallet balance in millisatoshis
+    ///
+    /// - Throws:
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    ///   - ``NWCError/notImplemented``: Wallet doesn't support balance queries
+    ///   - Network or parsing errors
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// do {
+    ///     let balanceMillisats = try await walletManager.getBalance()
+    ///     let balanceSats = balanceMillisats / 1000
+    ///     print("Balance: \(balanceSats) sats")
+    /// } catch {
+    ///     print("Failed to get balance: \(error)")
+    /// }
+    /// ```
+    ///
+    /// - Note: The balance is also stored in the ``balance`` published property for observation.
     public func getBalance() async throws -> Int64 {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
@@ -327,7 +622,39 @@ public class WalletConnectManager: ObservableObject {
         return balance
     }
     
-    /// Create a lightning invoice
+    /// Creates a Lightning invoice for receiving payments.
+    ///
+    /// Generates a BOLT11 invoice that others can pay to send funds to your wallet.
+    ///
+    /// - Parameters:
+    ///   - amount: The amount to receive in millisatoshis
+    ///   - description: Optional description/memo for the invoice
+    ///   - expiry: Optional expiry time in seconds (default varies by wallet)
+    ///
+    /// - Returns: A BOLT11 invoice string that can be paid by others
+    ///
+    /// - Throws:
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    ///   - ``NWCError/notImplemented``: Wallet doesn't support invoice creation
+    ///   - Other wallet-specific errors
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// do {
+    ///     // Create invoice for 1000 sats
+    ///     let invoice = try await walletManager.makeInvoice(
+    ///         amount: 1_000_000, // 1000 sats in millisats
+    ///         description: "Coffee payment",
+    ///         expiry: 3600 // 1 hour
+    ///     )
+    ///     
+    ///     // Display as QR code or share
+    ///     showQRCode(for: invoice)
+    /// } catch {
+    ///     print("Failed to create invoice: \(error)")
+    /// }
+    /// ```
     public func makeInvoice(amount: Int64, description: String? = nil, expiry: Int? = nil) async throws -> String {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
@@ -372,7 +699,42 @@ public class WalletConnectManager: ObservableObject {
         return invoice
     }
     
-    /// List recent transactions
+    /// Retrieves transaction history from the connected wallet.
+    ///
+    /// Fetches a list of recent transactions within the specified time range.
+    ///
+    /// - Parameters:
+    ///   - from: Optional start date for the transaction range
+    ///   - until: Optional end date for the transaction range
+    ///   - limit: Maximum number of transactions to return
+    ///
+    /// - Returns: An array of ``NWCTransaction`` objects representing the transaction history
+    ///
+    /// - Throws:
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    ///   - ``NWCError/notImplemented``: Wallet doesn't support transaction listing
+    ///   - Network or parsing errors
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// do {
+    ///     // Get last 7 days of transactions
+    ///     let weekAgo = Date().addingTimeInterval(-7 * 24 * 60 * 60)
+    ///     let transactions = try await walletManager.listTransactions(
+    ///         from: weekAgo,
+    ///         limit: 50
+    ///     )
+    ///     
+    ///     for tx in transactions {
+    ///         print("\(tx.type): \(tx.amount) millisats")
+    ///     }
+    /// } catch {
+    ///     print("Failed to load transactions: \(error)")
+    /// }
+    /// ```
+    ///
+    /// - Note: The transactions are also stored in ``recentTransactions`` for observation.
     public func listTransactions(from: Date? = nil, until: Date? = nil, limit: Int? = nil) async throws -> [NWCTransaction] {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
@@ -622,26 +984,45 @@ public class WalletConnectManager: ObservableObject {
 
 // MARK: - Convenience Extensions
 
-public extension WalletConnectManager {
+extension WalletConnectManager {
     
-    /// Check if wallet supports a specific method
-    func supportsMethod(_ method: NWCMethod) -> Bool {
+    /// Checks if the active wallet supports a specific NWC method.
+    ///
+    /// Use this to conditionally enable features based on wallet capabilities.
+    ///
+    /// - Parameter method: The NWC method to check support for
+    /// - Returns: `true` if the wallet supports the method, `false` otherwise
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// if walletManager.supportsMethod(.payInvoice) {
+    ///     // Show payment UI
+    /// } else {
+    ///     // Show "not supported" message
+    /// }
+    /// ```
+    public func supportsMethod(_ method: NWCMethod) -> Bool {
         guard let capabilities = activeConnection?.capabilities else {
             return false
         }
         return capabilities.methods.contains(method)
     }
     
-    /// Check if wallet supports notifications
-    var supportsNotifications: Bool {
+    /// Indicates whether the active wallet supports real-time notifications.
+    ///
+    /// When `true`, the wallet will send notifications for incoming and outgoing payments.
+    public var supportsNotifications: Bool {
         guard let capabilities = activeConnection?.capabilities else {
             return false
         }
         return !capabilities.notifications.isEmpty
     }
     
-    /// Get preferred encryption scheme
-    var preferredEncryption: NWCEncryption {
+    /// The preferred encryption scheme for the active wallet connection.
+    ///
+    /// Returns NIP-44 if supported, otherwise falls back to NIP-04 for legacy compatibility.
+    public var preferredEncryption: NWCEncryption {
         guard let capabilities = activeConnection?.capabilities else {
             return .nip04 // Default to legacy
         }

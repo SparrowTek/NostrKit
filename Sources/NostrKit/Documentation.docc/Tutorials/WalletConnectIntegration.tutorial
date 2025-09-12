@@ -1,0 +1,528 @@
+@Tutorial(time: 20) {
+    @Intro(title: "Integrating Lightning Wallets with Nostr") {
+        Learn how to add Lightning payment capabilities to your Nostr app using the Nostr Wallet Connect protocol (NIP-47).
+        
+        This tutorial will guide you through setting up wallet connections, making payments, and handling notifications from Lightning wallet services.
+        
+        @Image(source: wallet-connect-intro.png, alt: "Nostr Wallet Connect flow diagram")
+    }
+    
+    @Section(title: "Setting Up the Wallet Manager") {
+        @ContentAndMedia {
+            First, we'll set up the WalletConnectManager in your app. This manager handles all wallet connections and payment operations.
+            
+            The WalletConnectManager is a SwiftUI-compatible ObservableObject that manages the lifecycle of wallet connections.
+            
+            @Image(source: wallet-manager-setup.png, alt: "WalletConnectManager architecture")
+        }
+        
+        @Steps {
+            @Step {
+                Import NostrKit and create a WalletConnectManager instance in your app's main view.
+                
+                @Code(name: "ContentView.swift", file: wallet-01-create.swift) {
+                    import SwiftUI
+                    import NostrKit
+                    
+                    struct ContentView: View {
+                        @StateObject private var walletManager = WalletConnectManager()
+                        
+                        var body: some View {
+                            NavigationView {
+                                WalletView()
+                                    .environmentObject(walletManager)
+                            }
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Create a view to display wallet connection status and provide connection controls.
+                
+                @Code(name: "WalletView.swift", file: wallet-02-status.swift) {
+                    struct WalletView: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        
+                        var body: some View {
+                            VStack(spacing: 20) {
+                                // Connection status
+                                HStack {
+                                    Circle()
+                                        .fill(connectionColor)
+                                        .frame(width: 12, height: 12)
+                                    
+                                    Text(connectionText)
+                                        .font(.headline)
+                                }
+                                
+                                // Connection controls
+                                if walletManager.connectionState == .disconnected {
+                                    ConnectButton()
+                                } else {
+                                    WalletControls()
+                                }
+                            }
+                            .padding()
+                        }
+                        
+                        var connectionColor: Color {
+                            switch walletManager.connectionState {
+                            case .connected: return .green
+                            case .connecting: return .orange
+                            case .disconnected: return .red
+                            case .error: return .red
+                            }
+                        }
+                        
+                        var connectionText: String {
+                            switch walletManager.connectionState {
+                            case .connected: return "Wallet Connected"
+                            case .connecting: return "Connecting..."
+                            case .disconnected: return "No Wallet Connected"
+                            case .error(let message): return "Error: \(message)"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Connecting to a Wallet") {
+        @ContentAndMedia {
+            Now we'll implement the wallet connection flow. Users can connect by scanning a QR code or pasting a connection URI.
+            
+            The connection URI contains the wallet service's public key, relay URL, and a shared secret for secure communication.
+            
+            @Image(source: wallet-connect-flow.png, alt: "Connection flow diagram")
+        }
+        
+        @Steps {
+            @Step {
+                Create a view for entering the wallet connection URI.
+                
+                @Code(name: "ConnectButton.swift", file: wallet-03-connect.swift) {
+                    struct ConnectButton: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        @State private var showConnectionSheet = false
+                        @State private var connectionURI = ""
+                        @State private var alias = ""
+                        
+                        var body: some View {
+                            Button("Connect Wallet") {
+                                showConnectionSheet = true
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .sheet(isPresented: $showConnectionSheet) {
+                                ConnectionSheet(uri: $connectionURI, alias: $alias)
+                            }
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Implement the connection sheet with URI input and QR code scanning.
+                
+                @Code(name: "ConnectionSheet.swift", file: wallet-04-sheet.swift) {
+                    struct ConnectionSheet: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        @Binding var uri: String
+                        @Binding var alias: String
+                        @Environment(\.dismiss) var dismiss
+                        @State private var isConnecting = false
+                        @State private var errorMessage: String?
+                        
+                        var body: some View {
+                            NavigationView {
+                                Form {
+                                    Section("Connection URI") {
+                                        TextField("nostr+walletconnect://...", text: $uri)
+                                            .textFieldStyle(.roundedBorder)
+                                            .autocapitalization(.none)
+                                            .disableAutocorrection(true)
+                                    }
+                                    
+                                    Section("Wallet Name (Optional)") {
+                                        TextField("My Lightning Wallet", text: $alias)
+                                            .textFieldStyle(.roundedBorder)
+                                    }
+                                    
+                                    if let error = errorMessage {
+                                        Section {
+                                            Text(error)
+                                                .foregroundColor(.red)
+                                        }
+                                    }
+                                }
+                                .navigationTitle("Connect Wallet")
+                                .navigationBarTitleDisplayMode(.inline)
+                                .toolbar {
+                                    ToolbarItem(placement: .cancellationAction) {
+                                        Button("Cancel") { dismiss() }
+                                    }
+                                    
+                                    ToolbarItem(placement: .confirmationAction) {
+                                        Button("Connect") {
+                                            Task { await connect() }
+                                        }
+                                        .disabled(uri.isEmpty || isConnecting)
+                                    }
+                                }
+                                .disabled(isConnecting)
+                                .overlay {
+                                    if isConnecting {
+                                        ProgressView("Connecting...")
+                                            .padding()
+                                            .background(.regularMaterial)
+                                            .cornerRadius(10)
+                                    }
+                                }
+                            }
+                        }
+                        
+                        func connect() async {
+                            isConnecting = true
+                            errorMessage = nil
+                            
+                            do {
+                                try await walletManager.connect(
+                                    uri: uri,
+                                    alias: alias.isEmpty ? nil : alias
+                                )
+                                dismiss()
+                            } catch {
+                                errorMessage = error.localizedDescription
+                            }
+                            
+                            isConnecting = false
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Making Payments") {
+        @ContentAndMedia {
+            With a wallet connected, you can now send Lightning payments. The wallet manager handles all the complexity of the NWC protocol.
+            
+            @Image(source: payment-flow.png, alt: "Payment flow diagram")
+        }
+        
+        @Steps {
+            @Step {
+                Create a payment interface for entering Lightning invoices.
+                
+                @Code(name: "PaymentView.swift", file: wallet-05-payment.swift) {
+                    struct PaymentView: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        @State private var invoice = ""
+                        @State private var isPayment = false
+                        @State private var paymentResult: PaymentResult?
+                        @State private var errorMessage: String?
+                        
+                        var body: some View {
+                            VStack(spacing: 20) {
+                                Text("Send Payment")
+                                    .font(.title2)
+                                
+                                TextField("Lightning Invoice", text: $invoice)
+                                    .textFieldStyle(.roundedBorder)
+                                    .autocapitalization(.none)
+                                    .disableAutocorrection(true)
+                                
+                                Button("Pay Invoice") {
+                                    Task { await payInvoice() }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(invoice.isEmpty || isPayment)
+                                
+                                if let result = paymentResult {
+                                    PaymentSuccessView(result: result)
+                                }
+                                
+                                if let error = errorMessage {
+                                    Text(error)
+                                        .foregroundColor(.red)
+                                        .padding()
+                                }
+                            }
+                            .padding()
+                        }
+                        
+                        func payInvoice() async {
+                            isPayment = true
+                            errorMessage = nil
+                            paymentResult = nil
+                            
+                            do {
+                                let result = try await walletManager.payInvoice(invoice)
+                                paymentResult = result
+                                invoice = ""
+                            } catch {
+                                errorMessage = error.localizedDescription
+                            }
+                            
+                            isPayment = false
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Display payment confirmation with details.
+                
+                @Code(name: "PaymentSuccessView.swift", file: wallet-06-success.swift) {
+                    struct PaymentSuccessView: View {
+                        let result: PaymentResult
+                        
+                        var body: some View {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Label("Payment Successful", systemImage: "checkmark.circle.fill")
+                                    .font(.headline)
+                                    .foregroundColor(.green)
+                                
+                                VStack(alignment: .leading, spacing: 8) {
+                                    if let preimage = result.preimage {
+                                        DetailRow(
+                                            label: "Preimage",
+                                            value: String(preimage.prefix(20)) + "..."
+                                        )
+                                    }
+                                    
+                                    if let feesPaid = result.feesPaid {
+                                        DetailRow(
+                                            label: "Fees",
+                                            value: "\(feesPaid) sats"
+                                        )
+                                    }
+                                }
+                                .padding()
+                                .background(Color.green.opacity(0.1))
+                                .cornerRadius(10)
+                            }
+                        }
+                    }
+                    
+                    struct DetailRow: View {
+                        let label: String
+                        let value: String
+                        
+                        var body: some View {
+                            HStack {
+                                Text(label)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text(value)
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Checking Balance") {
+        @ContentAndMedia {
+            You can query the wallet's balance to show users their available funds before making payments.
+            
+            @Image(source: balance-display.png, alt: "Balance display")
+        }
+        
+        @Steps {
+            @Step {
+                Create a balance display component.
+                
+                @Code(name: "BalanceView.swift", file: wallet-07-balance.swift) {
+                    struct BalanceView: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        @State private var balance: Int64?
+                        @State private var isLoading = false
+                        
+                        var body: some View {
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text("Balance")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    
+                                    if isLoading {
+                                        ProgressView()
+                                            .scaleEffect(0.8)
+                                    } else if let balance = balance {
+                                        Text("\(balance) sats")
+                                            .font(.title2)
+                                            .fontWeight(.bold)
+                                    } else {
+                                        Text("--")
+                                            .font(.title2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                
+                                Spacer()
+                                
+                                Button(action: { Task { await fetchBalance() } }) {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                .buttonStyle(.borderless)
+                                .disabled(isLoading)
+                            }
+                            .padding()
+                            .background(Color.secondary.opacity(0.1))
+                            .cornerRadius(12)
+                            .task {
+                                await fetchBalance()
+                            }
+                        }
+                        
+                        func fetchBalance() async {
+                            guard walletManager.connectionState == .connected else { return }
+                            
+                            isLoading = true
+                            defer { isLoading = false }
+                            
+                            do {
+                                balance = try await walletManager.getBalance()
+                            } catch {
+                                print("Failed to fetch balance: \(error)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Handling Multiple Wallets") {
+        @ContentAndMedia {
+            The WalletConnectManager supports multiple wallet connections, allowing users to switch between different Lightning wallets.
+            
+            @Image(source: multiple-wallets.png, alt: "Multiple wallet connections")
+        }
+        
+        @Steps {
+            @Step {
+                Create a wallet switcher interface.
+                
+                @Code(name: "WalletSwitcher.swift", file: wallet-08-switcher.swift) {
+                    struct WalletSwitcher: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        
+                        var body: some View {
+                            List {
+                                ForEach(walletManager.connections) { connection in
+                                    WalletRow(connection: connection)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            Task {
+                                                try? await walletManager.switchConnection(to: connection.id)
+                                            }
+                                        }
+                                }
+                                .onDelete { indexSet in
+                                    for index in indexSet {
+                                        let connection = walletManager.connections[index]
+                                        Task {
+                                            try? await walletManager.removeConnection(connection.id)
+                                        }
+                                    }
+                                }
+                            }
+                            .navigationTitle("Wallets")
+                        }
+                    }
+                    
+                    struct WalletRow: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        let connection: WalletConnection
+                        
+                        var body: some View {
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(connection.alias ?? "Unnamed Wallet")
+                                        .font(.headline)
+                                    
+                                    Text(connection.walletPubkey.prefix(16) + "...")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                
+                                Spacer()
+                                
+                                if connection.id == walletManager.activeConnection?.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.green)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Assessments {
+        @MultipleChoice {
+            What protocol does Nostr Wallet Connect use for secure communication?
+            
+            @Choice(isCorrect: false) {
+                HTTP REST API
+                
+                @Justification {
+                    NWC uses Nostr events over WebSocket connections, not HTTP REST APIs.
+                }
+            }
+            
+            @Choice(isCorrect: true) {
+                Encrypted Nostr events
+                
+                @Justification {
+                    Correct! NWC uses encrypted Nostr events (NIP-44 or NIP-04) for secure communication between the app and wallet service.
+                }
+            }
+            
+            @Choice(isCorrect: false) {
+                Direct TCP connections
+                
+                @Justification {
+                    NWC communicates through Nostr relays using WebSocket connections, not direct TCP.
+                }
+            }
+        }
+        
+        @MultipleChoice {
+            Which event kind is used for NWC payment requests?
+            
+            @Choice(isCorrect: false) {
+                13194
+                
+                @Justification {
+                    Event kind 13194 is used for wallet info events, not payment requests.
+                }
+            }
+            
+            @Choice(isCorrect: true) {
+                23194
+                
+                @Justification {
+                    Correct! Event kind 23194 is used for NWC request events, including payment requests.
+                }
+            }
+            
+            @Choice(isCorrect: false) {
+                23195
+                
+                @Justification {
+                    Event kind 23195 is used for NWC response events, not requests.
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,508 @@
+@Tutorial(time: 15) {
+    @Intro(title: "Getting Started with NostrKit") {
+        Learn how to set up NostrKit in your iOS application and connect to the Nostr network.
+        
+        This tutorial will guide you through the basics of creating a Nostr client, from generating keys to publishing your first event and subscribing to feeds.
+        
+        @Image(source: nostr-intro.png, alt: "Nostr network diagram")
+    }
+    
+    @Section(title: "Setting Up NostrKit") {
+        @ContentAndMedia {
+            First, we'll add NostrKit to your project and set up the basic components needed to interact with the Nostr network.
+            
+            NostrKit provides all the tools you need to build a full-featured Nostr client on iOS.
+            
+            @Image(source: nostrkit-architecture.png, alt: "NostrKit architecture overview")
+        }
+        
+        @Steps {
+            @Step {
+                Add NostrKit to your project using Swift Package Manager.
+                
+                In Xcode, select **File → Add Package Dependencies** and enter the NostrKit repository URL.
+                
+                @Code(name: "Package.swift", file: setup-01-package.swift) {
+                    dependencies: [
+                        .package(
+                            url: "https://github.com/SparrowTek/NostrKit.git",
+                            from: "1.0.0"
+                        )
+                    ],
+                    targets: [
+                        .target(
+                            name: "YourApp",
+                            dependencies: ["NostrKit"]
+                        )
+                    ]
+                }
+            }
+            
+            @Step {
+                Import NostrKit and CoreNostr in your Swift files.
+                
+                @Code(name: "ContentView.swift", file: setup-02-import.swift) {
+                    import SwiftUI
+                    import NostrKit
+                    import CoreNostr
+                    
+                    struct ContentView: View {
+                        var body: some View {
+                            Text("Welcome to Nostr!")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Creating Your Identity") {
+        @ContentAndMedia {
+            Every Nostr user has a cryptographic key pair. The private key is your identity and must be kept secret. The public key is shared with others.
+            
+            NostrKit provides secure key generation and storage using the iOS Keychain.
+            
+            @Image(source: key-generation.png, alt: "Key pair generation")
+        }
+        
+        @Steps {
+            @Step {
+                Generate a new key pair for your Nostr identity.
+                
+                @Code(name: "KeyManager.swift", file: keys-01-generate.swift) {
+                    import NostrKit
+                    import CoreNostr
+                    
+                    class KeyManager {
+                        private var keyPair: KeyPair?
+                        
+                        func generateNewIdentity() throws {
+                            // Generate a new key pair
+                            keyPair = try KeyPair()
+                            
+                            // Get the keys in different formats
+                            let privateKeyHex = keyPair?.privateKey
+                            let publicKeyHex = keyPair?.publicKey
+                            
+                            // Bech32-encoded versions (human-readable)
+                            let nsec = keyPair?.nsec  // Private key (starts with "nsec1")
+                            let npub = keyPair?.npub  // Public key (starts with "npub1")
+                            
+                            print("Your public key (npub): \(npub ?? "")")
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Store the private key securely in the iOS Keychain.
+                
+                @Code(name: "KeyManager.swift", file: keys-02-store.swift) {
+                    import NostrKit
+                    import CoreNostr
+                    
+                    class KeyManager {
+                        private let keyStore = SecureKeyStore()
+                        private var keyPair: KeyPair?
+                        
+                        func generateAndStore() throws {
+                            // Generate new key pair
+                            keyPair = try KeyPair()
+                            
+                            // Store securely in keychain
+                            try keyStore.store(
+                                keyPair: keyPair!,
+                                identifier: "main-identity"
+                            )
+                        }
+                        
+                        func loadStoredKey() throws {
+                            // Load from keychain
+                            keyPair = try keyStore.load(identifier: "main-identity")
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Connecting to Relays") {
+        @ContentAndMedia {
+            Relays are servers that store and transmit Nostr events. You need to connect to at least one relay to participate in the network.
+            
+            NostrKit's RelayPool manages connections to multiple relays for redundancy.
+            
+            @Image(source: relay-connections.png, alt: "Connecting to multiple relays")
+        }
+        
+        @Steps {
+            @Step {
+                Create a RelayPool and add relay connections.
+                
+                @Code(name: "NostrManager.swift", file: relays-01-setup.swift) {
+                    import NostrKit
+                    import CoreNostr
+                    
+                    @MainActor
+                    class NostrManager: ObservableObject {
+                        let relayPool = RelayPool()
+                        private let keyPair: KeyPair
+                        
+                        init() throws {
+                            self.keyPair = try KeyPair()
+                            
+                            Task {
+                                await setupRelays()
+                            }
+                        }
+                        
+                        func setupRelays() async {
+                            do {
+                                // Add popular public relays
+                                try await relayPool.addRelay(url: "wss://relay.damus.io")
+                                try await relayPool.addRelay(url: "wss://relay.nostr.band")
+                                try await relayPool.addRelay(url: "wss://nos.lol")
+                                
+                                // Connect to all relays
+                                await relayPool.connectAll()
+                            } catch {
+                                print("Failed to set up relays: \(error)")
+                            }
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Monitor relay connection status.
+                
+                @Code(name: "NostrManager.swift", file: relays-02-monitor.swift) {
+                    @MainActor
+                    class NostrManager: ObservableObject {
+                        @Published var connectedRelays: [String] = []
+                        let relayPool = RelayPool()
+                        
+                        func monitorConnections() {
+                            Task {
+                                for await status in await relayPool.connectionStatus {
+                                    await MainActor.run {
+                                        if status.isConnected {
+                                            connectedRelays.append(status.url)
+                                        } else {
+                                            connectedRelays.removeAll { $0 == status.url }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Publishing Your First Event") {
+        @ContentAndMedia {
+            Events are the fundamental unit of data in Nostr. Let's publish your first text note to the network.
+            
+            @Image(source: event-publishing.png, alt: "Publishing an event")
+        }
+        
+        @Steps {
+            @Step {
+                Create and sign a text note event.
+                
+                @Code(name: "NostrManager.swift", file: publish-01-create.swift) {
+                    func publishTextNote(content: String) async throws {
+                        // Create a text note event (kind 1)
+                        let event = try NostrEvent(
+                            pubkey: keyPair.publicKey,
+                            createdAt: Date(),
+                            kind: 1,
+                            tags: [],
+                            content: content
+                        )
+                        
+                        // Sign the event with your private key
+                        let signedEvent = try keyPair.signEvent(event)
+                        
+                        // Publish to all connected relays
+                        let results = await relayPool.publish(signedEvent)
+                        
+                        // Check results
+                        for result in results {
+                            if result.success {
+                                print("Published to \(result.relay)")
+                            } else if let error = result.error {
+                                print("Failed to publish to \(result.relay): \(error)")
+                            }
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Add a simple UI for composing and publishing notes.
+                
+                @Code(name: "ComposeView.swift", file: publish-02-ui.swift) {
+                    struct ComposeView: View {
+                        @EnvironmentObject var nostrManager: NostrManager
+                        @State private var noteContent = ""
+                        @State private var isPublishing = false
+                        
+                        var body: some View {
+                            VStack {
+                                Text("Compose Note")
+                                    .font(.headline)
+                                
+                                TextEditor(text: $noteContent)
+                                    .padding(4)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .stroke(Color.secondary.opacity(0.2))
+                                    )
+                                    .frame(minHeight: 100)
+                                
+                                Button(action: publishNote) {
+                                    if isPublishing {
+                                        ProgressView()
+                                            .progressViewStyle(CircularProgressViewStyle())
+                                    } else {
+                                        Text("Publish")
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(noteContent.isEmpty || isPublishing)
+                            }
+                            .padding()
+                        }
+                        
+                        func publishNote() {
+                            isPublishing = true
+                            
+                            Task {
+                                do {
+                                    try await nostrManager.publishTextNote(content: noteContent)
+                                    noteContent = ""
+                                } catch {
+                                    print("Failed to publish: \(error)")
+                                }
+                                
+                                isPublishing = false
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Subscribing to Events") {
+        @ContentAndMedia {
+            To see events from other users, you need to subscribe with filters that specify what kind of events you want to receive.
+            
+            @Image(source: subscription-flow.png, alt: "Event subscription flow")
+        }
+        
+        @Steps {
+            @Step {
+                Create a subscription to the global feed.
+                
+                @Code(name: "NostrManager.swift", file: subscribe-01-global.swift) {
+                    @MainActor
+                    class NostrManager: ObservableObject {
+                        @Published var events: [NostrEvent] = []
+                        private var subscription: PoolSubscription?
+                        
+                        func subscribeToGlobalFeed() async throws {
+                            // Create a filter for text notes
+                            let filter = Filter(
+                                kinds: [1],  // Text notes
+                                limit: 50    // Last 50 events
+                            )
+                            
+                            // Subscribe to events
+                            subscription = try await relayPool.subscribe(filters: [filter])
+                            
+                            // Process incoming events
+                            Task {
+                                guard let subscription = subscription else { return }
+                                
+                                for await event in await subscription.events {
+                                    await MainActor.run {
+                                        // Add to beginning for newest first
+                                        self.events.insert(event, at: 0)
+                                        
+                                        // Limit array size
+                                        if self.events.count > 100 {
+                                            self.events.removeLast()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Create a feed view to display events.
+                
+                @Code(name: "FeedView.swift", file: subscribe-02-feed.swift) {
+                    struct FeedView: View {
+                        @EnvironmentObject var nostrManager: NostrManager
+                        
+                        var body: some View {
+                            ScrollView {
+                                LazyVStack(spacing: 12) {
+                                    ForEach(nostrManager.events, id: \.id) { event in
+                                        EventRow(event: event)
+                                    }
+                                }
+                                .padding()
+                            }
+                            .task {
+                                do {
+                                    try await nostrManager.subscribeToGlobalFeed()
+                                } catch {
+                                    print("Failed to subscribe: \(error)")
+                                }
+                            }
+                        }
+                    }
+                    
+                    struct EventRow: View {
+                        let event: NostrEvent
+                        
+                        var body: some View {
+                            VStack(alignment: .leading, spacing: 8) {
+                                // Author
+                                Text(String(event.pubkey.prefix(16)) + "...")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                
+                                // Content
+                                Text(event.content)
+                                    .font(.body)
+                                
+                                // Timestamp
+                                Text(formattedDate)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding()
+                            .background(Color.secondary.opacity(0.1))
+                            .cornerRadius(10)
+                        }
+                        
+                        var formattedDate: String {
+                            let date = Date(timeIntervalSince1970: TimeInterval(event.createdAt))
+                            let formatter = RelativeDateTimeFormatter()
+                            return formatter.localizedString(for: date, relativeTo: Date())
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Subscribe to specific authors instead of the global feed.
+                
+                @Code(name: "NostrManager.swift", file: subscribe-03-following.swift) {
+                    func subscribeToFollowing(pubkeys: [String]) async throws {
+                        // Create a filter for specific authors
+                        let filter = Filter(
+                            authors: pubkeys,
+                            kinds: [1, 6, 7],  // Notes, reposts, reactions
+                            since: Date().addingTimeInterval(-86400),  // Last 24 hours
+                            limit: 100
+                        )
+                        
+                        subscription = try await relayPool.subscribe(filters: [filter])
+                        
+                        // Process events (same as before)
+                        Task {
+                            guard let subscription = subscription else { return }
+                            
+                            for await event in await subscription.events {
+                                await MainActor.run {
+                                    processIncomingEvent(event)
+                                }
+                            }
+                        }
+                    }
+                    
+                    func processIncomingEvent(_ event: NostrEvent) {
+                        switch event.kind {
+                        case 1:  // Text note
+                            events.insert(event, at: 0)
+                        case 6:  // Repost
+                            handleRepost(event)
+                        case 7:  // Reaction
+                            handleReaction(event)
+                        default:
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Assessments {
+        @MultipleChoice {
+            What format does Nostr use for human-readable public keys?
+            
+            @Choice(isCorrect: false) {
+                Hexadecimal strings
+                
+                @Justification {
+                    While Nostr internally uses hex, human-readable keys use a different format.
+                }
+            }
+            
+            @Choice(isCorrect: true) {
+                Bech32 encoding (npub/nsec)
+                
+                @Justification {
+                    Correct! Nostr uses Bech32 encoding with npub prefix for public keys and nsec for private keys.
+                }
+            }
+            
+            @Choice(isCorrect: false) {
+                Base64 encoding
+                
+                @Justification {
+                    Nostr doesn't use Base64 for key encoding.
+                }
+            }
+        }
+        
+        @MultipleChoice {
+            What is the event kind for a standard text note in Nostr?
+            
+            @Choice(isCorrect: false) {
+                0
+                
+                @Justification {
+                    Kind 0 is used for metadata/profile events, not text notes.
+                }
+            }
+            
+            @Choice(isCorrect: true) {
+                1
+                
+                @Justification {
+                    Correct! Kind 1 is the standard event type for text notes in Nostr.
+                }
+            }
+            
+            @Choice(isCorrect: false) {
+                3
+                
+                @Justification {
+                    Kind 3 is used for contact list events, not text notes.
+                }
+            }
+        }
+    }
+}
