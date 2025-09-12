@@ -1,0 +1,1927 @@
+@Tutorial(time: 45) {
+    @Intro(title: "Complete Guide to NIP-47 Nostr Wallet Connect") {
+        Master Lightning wallet integration in your Nostr app using NIP-47 (Nostr Wallet Connect).
+        
+        NIP-47 enables seamless Lightning Network payments through Nostr events, allowing your app to interact with Lightning wallets without managing private keys or running Lightning nodes. This tutorial covers everything from basic setup to production deployment.
+        
+        @Image(source: nip47-overview.png, alt: "NIP-47 Protocol Overview")
+    }
+    
+    @Section(title: "Understanding NIP-47 Protocol") {
+        @ContentAndMedia {
+            Before diving into code, let's understand how NIP-47 works under the hood.
+            
+            NIP-47 uses encrypted Nostr events to communicate between your app and a Lightning wallet service. The protocol defines specific event kinds and a standard request/response format for wallet operations.
+            
+            Key components:
+            - **Connection URI**: Contains wallet pubkey, relay URL, and shared secret
+            - **Encrypted Events**: All communication is encrypted using NIP-44 or NIP-04
+            - **Request/Response Pattern**: Async communication through Nostr events
+            
+            @Image(source: nip47-flow.png, alt: "NIP-47 Communication Flow")
+        }
+        
+        @Steps {
+            @Step {
+                Understand the NIP-47 connection URI format that establishes the wallet connection.
+                
+                @Code(name: "ConnectionURI.swift", file: nip47-01-uri.swift) {
+                    // NIP-47 Connection URI Format
+                    // nostr+walletconnect://pubkey?relay=wss://relay.url&secret=sharedsecret
+                    
+                    struct NWCConnectionURI {
+                        let walletPubkey: String    // Wallet service's public key
+                        let relayURL: String         // Relay for communication
+                        let secret: String           // Shared secret for encryption
+                        let lud16: String?          // Optional Lightning address
+                        
+                        init?(from uri: String) {
+                            guard uri.hasPrefix("nostr+walletconnect://") else {
+                                return nil
+                            }
+                            
+                            // Parse components
+                            let components = URLComponents(string: uri)
+                            guard let host = components?.host,
+                                  let queryItems = components?.queryItems else {
+                                return nil
+                            }
+                            
+                            self.walletPubkey = host
+                            self.relayURL = queryItems.first { $0.name == "relay" }?.value ?? ""
+                            self.secret = queryItems.first { $0.name == "secret" }?.value ?? ""
+                            self.lud16 = queryItems.first { $0.name == "lud16" }?.value
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Learn about the NWC event kinds used for different operations.
+                
+                @Code(name: "EventKinds.swift", file: nip47-02-events.swift) {
+                    // NIP-47 Event Kinds
+                    enum NWCEventKind: Int {
+                        // Public wallet information
+                        case info = 13194
+                        
+                        // Encrypted request from app to wallet
+                        case request = 23194
+                        
+                        // Encrypted response from wallet to app
+                        case response = 23195
+                        
+                        // Notifications from wallet (payments received, etc.)
+                        case notification = 23197
+                    }
+                    
+                    // NWC Methods (request types)
+                    enum NWCMethod: String {
+                        // Payment operations
+                        case payInvoice = "pay_invoice"
+                        case makeInvoice = "make_invoice"
+                        case payKeysend = "pay_keysend"
+                        
+                        // Wallet information
+                        case getBalance = "get_balance"
+                        case getInfo = "get_info"
+                        
+                        // Transaction history
+                        case listTransactions = "list_transactions"
+                        case lookupInvoice = "lookup_invoice"
+                        
+                        // Multi-payment
+                        case multiPayInvoice = "multi_pay_invoice"
+                        case multiPayKeysend = "multi_pay_keysend"
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Setting Up WalletConnectManager") {
+        @ContentAndMedia {
+            Now let's set up the WalletConnectManager in your app. This manager handles all wallet connections and operations.
+            
+            The manager is designed as an ObservableObject for easy SwiftUI integration and maintains the state of all wallet connections.
+            
+            @Image(source: wallet-manager-architecture.png, alt: "WalletConnectManager Architecture")
+        }
+        
+        @Steps {
+            @Step {
+                Create your app's main view with WalletConnectManager integration.
+                
+                @Code(name: "App.swift", file: nip47-03-app.swift) {
+                    import SwiftUI
+                    import NostrKit
+                    import CoreNostr
+                    
+                    @main
+                    struct LightningApp: App {
+                        // Create wallet manager as StateObject
+                        @StateObject private var walletManager = WalletConnectManager()
+                        
+                        // Create key manager for Nostr identity
+                        @StateObject private var keyManager = KeyManager()
+                        
+                        var body: some Scene {
+                            WindowGroup {
+                                ContentView()
+                                    .environmentObject(walletManager)
+                                    .environmentObject(keyManager)
+                                    .task {
+                                        // Initialize on launch
+                                        await initializeApp()
+                                    }
+                            }
+                        }
+                        
+                        func initializeApp() async {
+                            // Load or generate Nostr keys
+                            do {
+                                try await keyManager.loadOrGenerateKeys()
+                                
+                                // Set up wallet manager with keys
+                                await walletManager.initialize(
+                                    keyPair: keyManager.keyPair!
+                                )
+                                
+                                // Restore previous connections
+                                await walletManager.restoreConnections()
+                            } catch {
+                                print("Initialization failed: \(error)")
+                            }
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Create a key manager to handle Nostr identity securely.
+                
+                @Code(name: "KeyManager.swift", file: nip47-04-keys.swift) {
+                    import NostrKit
+                    import CoreNostr
+                    
+                    @MainActor
+                    class KeyManager: ObservableObject {
+                        @Published var keyPair: KeyPair?
+                        @Published var npub: String = ""
+                        
+                        private let keyStore = SecureKeyStore()
+                        private let keyIdentifier = "main-nostr-identity"
+                        
+                        func loadOrGenerateKeys() async throws {
+                            // Try to load existing keys
+                            if let stored = try? keyStore.load(identifier: keyIdentifier) {
+                                self.keyPair = stored
+                                self.npub = stored.npub
+                                print("Loaded existing identity: \(npub)")
+                            } else {
+                                // Generate new key pair
+                                let newKeyPair = try KeyPair()
+                                
+                                // Store securely in keychain
+                                try keyStore.store(
+                                    keyPair: newKeyPair,
+                                    identifier: keyIdentifier
+                                )
+                                
+                                self.keyPair = newKeyPair
+                                self.npub = newKeyPair.npub
+                                print("Generated new identity: \(npub)")
+                            }
+                        }
+                        
+                        func deleteKeys() throws {
+                            try keyStore.delete(identifier: keyIdentifier)
+                            self.keyPair = nil
+                            self.npub = ""
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Extend WalletConnectManager with persistence for connection management.
+                
+                @Code(name: "WalletConnectManager+Persistence.swift", file: nip47-05-persistence.swift) {
+                    import Foundation
+                    import NostrKit
+                    
+                    extension WalletConnectManager {
+                        private var connectionsKey: String { "nwc_connections" }
+                        
+                        /// Saves connection URIs securely
+                        func saveConnections() async {
+                            let uris = connections.compactMap { connection in
+                                // Recreate URI from connection data
+                                var components = URLComponents()
+                                components.scheme = "nostr+walletconnect"
+                                components.host = connection.walletPubkey
+                                components.queryItems = [
+                                    URLQueryItem(name: "relay", value: connection.relayURL),
+                                    URLQueryItem(name: "secret", value: connection.secret)
+                                ]
+                                
+                                if let lud16 = connection.lud16 {
+                                    components.queryItems?.append(
+                                        URLQueryItem(name: "lud16", value: lud16)
+                                    )
+                                }
+                                
+                                return components.string
+                            }
+                            
+                            // Store in UserDefaults (consider Keychain for production)
+                            UserDefaults.standard.set(uris, forKey: connectionsKey)
+                        }
+                        
+                        /// Restores saved connections
+                        func restoreConnections() async {
+                            guard let savedURIs = UserDefaults.standard.stringArray(
+                                forKey: connectionsKey
+                            ) else { return }
+                            
+                            for uri in savedURIs {
+                                do {
+                                    try await connect(uri: uri)
+                                    print("Restored connection: \(uri.prefix(50))...")
+                                } catch {
+                                    print("Failed to restore connection: \(error)")
+                                }
+                            }
+                        }
+                        
+                        /// Clears all saved connections
+                        func clearSavedConnections() async {
+                            UserDefaults.standard.removeObject(forKey: connectionsKey)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Connecting to Lightning Wallets") {
+        @ContentAndMedia {
+            Let's implement the wallet connection flow with proper UI and error handling.
+            
+            Users can connect their wallets by:
+            - Scanning a QR code containing the connection URI
+            - Pasting a connection string
+            - Selecting from popular wallet services
+            
+            @Image(source: wallet-connection-ui.png, alt: "Wallet Connection Interface")
+        }
+        
+        @Steps {
+            @Step {
+                Create a wallet connection view with QR scanner support.
+                
+                @Code(name: "WalletConnectionView.swift", file: nip47-06-connection-view.swift) {
+                    import SwiftUI
+                    import CodeScanner // Add package: github.com/twostraws/CodeScanner
+                    import NostrKit
+                    
+                    struct WalletConnectionView: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        @State private var connectionMode: ConnectionMode = .scan
+                        @State private var connectionURI = ""
+                        @State private var walletAlias = ""
+                        @State private var isConnecting = false
+                        @State private var error: Error?
+                        @State private var showScanner = false
+                        
+                        enum ConnectionMode: String, CaseIterable {
+                            case scan = "Scan QR"
+                            case paste = "Paste URI"
+                            case popular = "Popular Wallets"
+                        }
+                        
+                        var body: some View {
+                            NavigationView {
+                                Form {
+                                    Section {
+                                        Picker("Connection Method", selection: $connectionMode) {
+                                            ForEach(ConnectionMode.allCases, id: \.self) { mode in
+                                                Text(mode.rawValue).tag(mode)
+                                            }
+                                        }
+                                        .pickerStyle(.segmented)
+                                    }
+                                    
+                                    switch connectionMode {
+                                    case .scan:
+                                        scanSection
+                                    case .paste:
+                                        pasteSection
+                                    case .popular:
+                                        popularSection
+                                    }
+                                    
+                                    if let error = error {
+                                        Section {
+                                            ErrorView(error: error)
+                                        }
+                                    }
+                                }
+                                .navigationTitle("Connect Wallet")
+                                .toolbar {
+                                    ToolbarItem(placement: .cancellationAction) {
+                                        Button("Cancel") { dismiss() }
+                                    }
+                                }
+                                .sheet(isPresented: $showScanner) {
+                                    CodeScannerView(
+                                        codeTypes: [.qr],
+                                        completion: handleScan
+                                    )
+                                }
+                                .disabled(isConnecting)
+                                .overlay {
+                                    if isConnecting {
+                                        ProgressView("Connecting...")
+                                            .padding()
+                                            .background(.regularMaterial)
+                                            .cornerRadius(10)
+                                    }
+                                }
+                            }
+                        }
+                        
+                        var scanSection: some View {
+                            Section {
+                                Button(action: { showScanner = true }) {
+                                    Label("Scan QR Code", systemImage: "qrcode.viewfinder")
+                                }
+                                
+                                TextField("Wallet Name (Optional)", text: $walletAlias)
+                                    .textFieldStyle(.roundedBorder)
+                            } header: {
+                                Text("Scan wallet QR code")
+                            }
+                        }
+                        
+                        var pasteSection: some View {
+                            Section {
+                                TextField("nostr+walletconnect://...", text: $connectionURI)
+                                    .textFieldStyle(.roundedBorder)
+                                    .autocapitalization(.none)
+                                    .disableAutocorrection(true)
+                                
+                                TextField("Wallet Name (Optional)", text: $walletAlias)
+                                    .textFieldStyle(.roundedBorder)
+                                
+                                Button("Connect", action: connectWallet)
+                                    .disabled(connectionURI.isEmpty)
+                            } header: {
+                                Text("Paste connection URI")
+                            }
+                        }
+                        
+                        var popularSection: some View {
+                            Section {
+                                ForEach(PopularWallet.allCases, id: \.self) { wallet in
+                                    Button(action: { connectPopular(wallet) }) {
+                                        HStack {
+                                            Image(wallet.icon)
+                                                .resizable()
+                                                .frame(width: 40, height: 40)
+                                            
+                                            VStack(alignment: .leading) {
+                                                Text(wallet.name)
+                                                    .font(.headline)
+                                                Text(wallet.description)
+                                                    .font(.caption)
+                                                    .foregroundColor(.secondary)
+                                            }
+                                            
+                                            Spacer()
+                                            
+                                            Image(systemName: "chevron.right")
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            } header: {
+                                Text("Popular wallet services")
+                            }
+                        }
+                        
+                        func handleScan(result: Result<ScanResult, ScanError>) {
+                            switch result {
+                            case .success(let result):
+                                connectionURI = result.string
+                                connectWallet()
+                            case .failure(let error):
+                                self.error = error
+                            }
+                        }
+                        
+                        func connectWallet() {
+                            isConnecting = true
+                            error = nil
+                            
+                            Task {
+                                do {
+                                    try await walletManager.connect(
+                                        uri: connectionURI,
+                                        alias: walletAlias.isEmpty ? nil : walletAlias
+                                    )
+                                    
+                                    // Save connection for restoration
+                                    await walletManager.saveConnections()
+                                    
+                                    dismiss()
+                                } catch {
+                                    self.error = error
+                                }
+                                
+                                isConnecting = false
+                            }
+                        }
+                        
+                        func connectPopular(_ wallet: PopularWallet) {
+                            // Navigate to wallet's connection page
+                            // This would open the wallet's website or app
+                            UIApplication.shared.open(wallet.connectionURL)
+                        }
+                        
+                        @Environment(\.dismiss) private var dismiss
+                    }
+                    
+                    enum PopularWallet: CaseIterable {
+                        case alby
+                        case mutiny
+                        case lifpay
+                        
+                        var name: String {
+                            switch self {
+                            case .alby: return "Alby"
+                            case .mutiny: return "Mutiny Wallet"
+                            case .lifpay: return "Lifpay"
+                            }
+                        }
+                        
+                        var description: String {
+                            switch self {
+                            case .alby: return "Browser extension wallet"
+                            case .mutiny: return "Self-custodial Lightning"
+                            case .lifpay: return "NWC-native wallet"
+                            }
+                        }
+                        
+                        var icon: String {
+                            switch self {
+                            case .alby: return "alby-icon"
+                            case .mutiny: return "mutiny-icon"
+                            case .lifpay: return "lifpay-icon"
+                            }
+                        }
+                        
+                        var connectionURL: URL {
+                            switch self {
+                            case .alby: 
+                                return URL(string: "https://getalby.com/nwc")!
+                            case .mutiny: 
+                                return URL(string: "https://app.mutinywallet.com/settings/connections")!
+                            case .lifpay:
+                                return URL(string: "https://lifpay.me/developer")!
+                            }
+                        }
+                    }
+                }
+            }
+            
+            @Step {
+                Display connected wallets with management options.
+                
+                @Code(name: "WalletListView.swift", file: nip47-07-wallet-list.swift) {
+                    struct WalletListView: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        @State private var showConnectionView = false
+                        @State private var selectedWallet: WalletConnection?
+                        
+                        var body: some View {
+                            List {
+                                if walletManager.connections.isEmpty {
+                                    EmptyStateView()
+                                } else {
+                                    ForEach(walletManager.connections) { connection in
+                                        WalletCard(
+                                            connection: connection,
+                                            isActive: connection.id == walletManager.activeConnection?.id
+                                        )
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            selectWallet(connection)
+                                        }
+                                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                            Button("Remove", role: .destructive) {
+                                                removeWallet(connection)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            .navigationTitle("Lightning Wallets")
+                            .toolbar {
+                                ToolbarItem(placement: .primaryAction) {
+                                    Button(action: { showConnectionView = true }) {
+                                        Image(systemName: "plus.circle.fill")
+                                    }
+                                }
+                            }
+                            .sheet(isPresented: $showConnectionView) {
+                                WalletConnectionView()
+                            }
+                            .sheet(item: $selectedWallet) { wallet in
+                                WalletDetailView(connection: wallet)
+                            }
+                        }
+                        
+                        func selectWallet(_ connection: WalletConnection) {
+                            Task {
+                                try? await walletManager.switchConnection(to: connection.id)
+                            }
+                        }
+                        
+                        func removeWallet(_ connection: WalletConnection) {
+                            Task {
+                                try? await walletManager.removeConnection(connection.id)
+                                await walletManager.saveConnections()
+                            }
+                        }
+                    }
+                    
+                    struct WalletCard: View {
+                        let connection: WalletConnection
+                        let isActive: Bool
+                        
+                        var body: some View {
+                            HStack {
+                                // Wallet icon
+                                Circle()
+                                    .fill(isActive ? Color.green : Color.gray)
+                                    .frame(width: 50, height: 50)
+                                    .overlay {
+                                        Image(systemName: "bolt.fill")
+                                            .foregroundColor(.white)
+                                    }
+                                
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(connection.alias ?? "Lightning Wallet")
+                                        .font(.headline)
+                                    
+                                    if let lud16 = connection.lud16 {
+                                        Text(lud16)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    } else {
+                                        Text(connection.walletPubkey.prefix(16) + "...")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                            .monospaced()
+                                    }
+                                    
+                                    HStack {
+                                        Label(
+                                            connection.state.description,
+                                            systemImage: connection.state.icon
+                                        )
+                                        .font(.caption2)
+                                        .foregroundColor(connection.state.color)
+                                        
+                                        if isActive {
+                                            Label("Active", systemImage: "checkmark.circle.fill")
+                                                .font(.caption2)
+                                                .foregroundColor(.green)
+                                        }
+                                    }
+                                }
+                                
+                                Spacer()
+                                
+                                // Balance preview (if available)
+                                if connection.lastBalance != nil {
+                                    VStack(alignment: .trailing) {
+                                        Text("\(connection.lastBalance!) sats")
+                                            .font(.headline)
+                                        Text("Balance")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 8)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Making Lightning Payments") {
+        @ContentAndMedia {
+            Implement Lightning invoice payments with proper validation and user feedback.
+            
+            The payment flow includes:
+            - Invoice validation and decoding
+            - Amount verification
+            - Payment confirmation
+            - Success/failure handling
+            
+            @Image(source: payment-flow.png, alt: "Payment Flow Diagram")
+        }
+        
+        @Steps {
+            @Step {
+                Create a payment interface with invoice scanning and validation.
+                
+                @Code(name: "PaymentView.swift", file: nip47-08-payment.swift) {
+                    import SwiftUI
+                    import NostrKit
+                    
+                    struct PaymentView: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        @State private var invoice = ""
+                        @State private var decodedInvoice: DecodedInvoice?
+                        @State private var paymentState: PaymentState = .idle
+                        @State private var paymentResult: PaymentResult?
+                        @State private var error: Error?
+                        @State private var showScanner = false
+                        @State private var showConfirmation = false
+                        
+                        enum PaymentState {
+                            case idle
+                            case validating
+                            case paying
+                            case completed
+                            case failed
+                        }
+                        
+                        var body: some View {
+                            ScrollView {
+                                VStack(spacing: 20) {
+                                    // Invoice input
+                                    invoiceInputSection
+                                    
+                                    // Decoded invoice details
+                                    if let decoded = decodedInvoice {
+                                        invoiceDetailsSection(decoded)
+                                    }
+                                    
+                                    // Payment button
+                                    if decodedInvoice != nil {
+                                        paymentButtonSection
+                                    }
+                                    
+                                    // Result display
+                                    if let result = paymentResult {
+                                        paymentResultSection(result)
+                                    }
+                                    
+                                    // Error display
+                                    if let error = error {
+                                        ErrorCard(error: error)
+                                    }
+                                }
+                                .padding()
+                            }
+                            .navigationTitle("Send Payment")
+                            .sheet(isPresented: $showScanner) {
+                                InvoiceScannerView { scannedInvoice in
+                                    self.invoice = scannedInvoice
+                                    validateInvoice()
+                                }
+                            }
+                            .confirmationDialog(
+                                "Confirm Payment",
+                                isPresented: $showConfirmation,
+                                presenting: decodedInvoice
+                            ) { invoice in
+                                Button("Pay \(invoice.amount) sats") {
+                                    performPayment()
+                                }
+                                Button("Cancel", role: .cancel) {}
+                            } message: { invoice in
+                                Text("Send \(invoice.amount) sats to \(invoice.description ?? "Lightning invoice")?")
+                            }
+                        }
+                        
+                        var invoiceInputSection: some View {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Lightning Invoice")
+                                    .font(.headline)
+                                
+                                HStack {
+                                    TextField("lnbc...", text: $invoice)
+                                        .textFieldStyle(.roundedBorder)
+                                        .autocapitalization(.none)
+                                        .disableAutocorrection(true)
+                                        .onChange(of: invoice) { _ in
+                                            if invoice.count > 10 {
+                                                validateInvoice()
+                                            }
+                                        }
+                                    
+                                    Button(action: { showScanner = true }) {
+                                        Image(systemName: "qrcode.viewfinder")
+                                            .font(.title2)
+                                    }
+                                    
+                                    Button(action: pasteFromClipboard) {
+                                        Image(systemName: "doc.on.clipboard")
+                                            .font(.title2)
+                                    }
+                                }
+                            }
+                            .padding()
+                            .background(Color(.systemBackground))
+                            .cornerRadius(12)
+                            .shadow(radius: 2)
+                        }
+                        
+                        func invoiceDetailsSection(_ invoice: DecodedInvoice) -> some View {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Invoice Details")
+                                    .font(.headline)
+                                
+                                DetailRow(label: "Amount", value: "\(invoice.amount) sats")
+                                
+                                if let description = invoice.description {
+                                    DetailRow(label: "Description", value: description)
+                                }
+                                
+                                DetailRow(
+                                    label: "Expires",
+                                    value: invoice.expiryDate.formatted(date: .abbreviated, time: .shortened)
+                                )
+                                
+                                if invoice.isExpired {
+                                    Label("Invoice Expired", systemImage: "exclamationmark.triangle.fill")
+                                        .foregroundColor(.red)
+                                }
+                            }
+                            .padding()
+                            .background(Color(.secondarySystemBackground))
+                            .cornerRadius(12)
+                        }
+                        
+                        var paymentButtonSection: some View {
+                            Button(action: { showConfirmation = true }) {
+                                HStack {
+                                    if paymentState == .paying {
+                                        ProgressView()
+                                            .progressViewStyle(CircularProgressViewStyle())
+                                            .scaleEffect(0.8)
+                                    } else {
+                                        Image(systemName: "bolt.fill")
+                                    }
+                                    
+                                    Text(paymentButtonText)
+                                        .fontWeight(.semibold)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(paymentButtonColor)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                            }
+                            .disabled(!canMakePayment)
+                        }
+                        
+                        var paymentButtonText: String {
+                            switch paymentState {
+                            case .idle, .validating:
+                                return "Pay Invoice"
+                            case .paying:
+                                return "Processing..."
+                            case .completed:
+                                return "Payment Sent!"
+                            case .failed:
+                                return "Payment Failed"
+                            }
+                        }
+                        
+                        var paymentButtonColor: Color {
+                            switch paymentState {
+                            case .completed:
+                                return .green
+                            case .failed:
+                                return .red
+                            default:
+                                return canMakePayment ? .blue : .gray
+                            }
+                        }
+                        
+                        var canMakePayment: Bool {
+                            guard let invoice = decodedInvoice else { return false }
+                            return !invoice.isExpired && 
+                                   paymentState != .paying &&
+                                   walletManager.connectionState == .connected
+                        }
+                        
+                        func validateInvoice() {
+                            paymentState = .validating
+                            error = nil
+                            
+                            Task {
+                                do {
+                                    // Decode invoice (would use real Lightning invoice decoder)
+                                    let decoded = try await decodeInvoice(invoice)
+                                    
+                                    await MainActor.run {
+                                        self.decodedInvoice = decoded
+                                        self.paymentState = .idle
+                                    }
+                                } catch {
+                                    await MainActor.run {
+                                        self.error = error
+                                        self.paymentState = .failed
+                                        self.decodedInvoice = nil
+                                    }
+                                }
+                            }
+                        }
+                        
+                        func performPayment() {
+                            paymentState = .paying
+                            error = nil
+                            
+                            Task {
+                                do {
+                                    let result = try await walletManager.payInvoice(invoice)
+                                    
+                                    await MainActor.run {
+                                        self.paymentResult = result
+                                        self.paymentState = .completed
+                                        
+                                        // Clear invoice for next payment
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                                            self.invoice = ""
+                                            self.decodedInvoice = nil
+                                            self.paymentState = .idle
+                                        }
+                                    }
+                                } catch {
+                                    await MainActor.run {
+                                        self.error = error
+                                        self.paymentState = .failed
+                                    }
+                                }
+                            }
+                        }
+                        
+                        func paymentResultSection(_ result: PaymentResult) -> some View {
+                            VStack(spacing: 12) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 60))
+                                    .foregroundColor(.green)
+                                
+                                Text("Payment Successful!")
+                                    .font(.title2)
+                                    .fontWeight(.bold)
+                                
+                                if let preimage = result.preimage {
+                                    VStack(alignment: .leading) {
+                                        Text("Payment Proof")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                        
+                                        Text(preimage)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                    .padding()
+                                    .background(Color(.tertiarySystemBackground))
+                                    .cornerRadius(8)
+                                }
+                                
+                                if let fees = result.feesPaid {
+                                    Text("Network fee: \(fees) sats")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .padding()
+                            .background(Color.green.opacity(0.1))
+                            .cornerRadius(12)
+                        }
+                        
+                        func pasteFromClipboard() {
+                            if let clipboard = UIPasteboard.general.string {
+                                invoice = clipboard
+                                validateInvoice()
+                            }
+                        }
+                    }
+                    
+                    // Mock invoice decoder (replace with real implementation)
+                    struct DecodedInvoice {
+                        let amount: Int64
+                        let description: String?
+                        let expiryDate: Date
+                        let paymentHash: String
+                        
+                        var isExpired: Bool {
+                            expiryDate < Date()
+                        }
+                    }
+                    
+                    func decodeInvoice(_ invoice: String) async throws -> DecodedInvoice {
+                        // This would use a real Lightning invoice decoder
+                        return DecodedInvoice(
+                            amount: 1000,
+                            description: "Test payment",
+                            expiryDate: Date().addingTimeInterval(3600),
+                            paymentHash: "abc123"
+                        )
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Creating Lightning Invoices") {
+        @ContentAndMedia {
+            Learn how to create Lightning invoices for receiving payments in your app.
+            
+            The invoice creation flow includes setting amounts, descriptions, and expiry times, then presenting the invoice as a QR code or copyable string.
+            
+            @Image(source: invoice-creation.png, alt: "Invoice Creation Interface")
+        }
+        
+        @Steps {
+            @Step {
+                Build an invoice creation interface with customizable parameters.
+                
+                @Code(name: "CreateInvoiceView.swift", file: nip47-09-invoice.swift) {
+                    import SwiftUI
+                    import CoreImage.CIFilterBuiltins
+                    import NostrKit
+                    
+                    struct CreateInvoiceView: View {
+                        @EnvironmentObject var walletManager: WalletConnectManager
+                        @State private var amount: String = ""
+                        @State private var description: String = ""
+                        @State private var expiryMinutes: Int = 60
+                        @State private var invoice: String?
+                        @State private var isCreating = false
+                        @State private var error: Error?
+                        @State private var showShareSheet = false
+                        
+                        let expiryOptions = [10, 30, 60, 180, 1440] // minutes
+                        
+                        var body: some View {
+                            ScrollView {
+                                VStack(spacing: 20) {
+                                    // Invoice parameters
+                                    parametersSection
+                                    
+                                    // Create button
+                                    createButton
+                                    
+                                    // Generated invoice
+                                    if let invoice = invoice {
+                                        invoiceDisplaySection(invoice)
+                                    }
+                                    
+                                    // Error display
+                                    if let error = error {
+                                        ErrorCard(error: error)
+                                    }
+                                }
+                                .padding()
+                            }
+                            .navigationTitle("Receive Payment")
+                            .sheet(isPresented: $showShareSheet) {
+                                if let invoice = invoice {
+                                    ShareSheet(items: [invoice])
+                                }
+                            }
+                        }
+                        
+                        var parametersSection: some View {
+                            VStack(alignment: .leading, spacing: 16) {
+                                Text("Invoice Details")
+                                    .font(.headline)
+                                
+                                // Amount input
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Label("Amount (sats)", systemImage: "bitcoinsign.circle")
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary)
+                                    
+                                    TextField("0", text: $amount)
+                                        .keyboardType(.numberPad)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.title2)
+                                    
+                                    // Quick amount buttons
+                                    HStack {
+                                        ForEach([100, 1000, 5000, 10000], id: \.self) { sats in
+                                            Button("\(sats)") {
+                                                amount = String(sats)
+                                            }
+                                            .buttonStyle(.bordered)
+                                        }
+                                    }
+                                }
+                                
+                                // Description input
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Label("Description", systemImage: "text.alignleft")
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary)
+                                    
+                                    TextField("What is this payment for?", text: $description)
+                                        .textFieldStyle(.roundedBorder)
+                                }
+                                
+                                // Expiry picker
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Label("Expires In", systemImage: "clock")
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary)
+                                    
+                                    Picker("Expiry", selection: $expiryMinutes) {
+                                        ForEach(expiryOptions, id: \.self) { minutes in
+                                            Text(formatExpiry(minutes)).tag(minutes)
+                                        }
+                                    }
+                                    .pickerStyle(.segmented)
+                                }
+                            }
+                            .padding()
+                            .background(Color(.systemBackground))
+                            .cornerRadius(12)
+                            .shadow(radius: 2)
+                        }
+                        
+                        var createButton: some View {
+                            Button(action: createInvoice) {
+                                HStack {
+                                    if isCreating {
+                                        ProgressView()
+                                            .progressViewStyle(CircularProgressViewStyle())
+                                            .scaleEffect(0.8)
+                                    } else {
+                                        Image(systemName: "qrcode")
+                                    }
+                                    
+                                    Text(isCreating ? "Creating..." : "Create Invoice")
+                                        .fontWeight(.semibold)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(createButtonColor)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                            }
+                            .disabled(!canCreateInvoice)
+                        }
+                        
+                        var createButtonColor: Color {
+                            canCreateInvoice ? .blue : .gray
+                        }
+                        
+                        var canCreateInvoice: Bool {
+                            guard let amountInt = Int64(amount), amountInt > 0 else { return false }
+                            return walletManager.connectionState == .connected && !isCreating
+                        }
+                        
+                        func invoiceDisplaySection(_ invoice: String) -> some View {
+                            VStack(spacing: 16) {
+                                Text("Invoice Created!")
+                                    .font(.headline)
+                                    .foregroundColor(.green)
+                                
+                                // QR Code
+                                if let qrImage = generateQRCode(from: invoice) {
+                                    Image(uiImage: qrImage)
+                                        .interpolation(.none)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 250, height: 250)
+                                        .padding()
+                                        .background(Color.white)
+                                        .cornerRadius(12)
+                                }
+                                
+                                // Invoice string
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Lightning Invoice")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    
+                                    Text(invoice)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .lineLimit(3)
+                                        .truncationMode(.middle)
+                                        .padding()
+                                        .background(Color(.tertiarySystemBackground))
+                                        .cornerRadius(8)
+                                }
+                                
+                                // Action buttons
+                                HStack(spacing: 12) {
+                                    Button(action: copyToClipboard) {
+                                        Label("Copy", systemImage: "doc.on.doc")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    
+                                    Button(action: { showShareSheet = true }) {
+                                        Label("Share", systemImage: "square.and.arrow.up")
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+                            .padding()
+                            .background(Color(.secondarySystemBackground))
+                            .cornerRadius(12)
+                        }
+                        
+                        func createInvoice() {
+                            guard let amountSats = Int64(amount) else { return }
+                            
+                            isCreating = true
+                            error = nil
+                            invoice = nil
+                            
+                            Task {
+                                do {
+                                    let result = try await walletManager.makeInvoice(
+                                        amount: amountSats,
+                                        description: description.isEmpty ? nil : description,
+                                        expiry: expiryMinutes * 60
+                                    )
+                                    
+                                    await MainActor.run {
+                                        self.invoice = result.invoice
+                                        self.isCreating = false
+                                    }
+                                } catch {
+                                    await MainActor.run {
+                                        self.error = error
+                                        self.isCreating = false
+                                    }
+                                }
+                            }
+                        }
+                        
+                        func generateQRCode(from string: String) -> UIImage? {
+                            let context = CIContext()
+                            let filter = CIFilter.qrCodeGenerator()
+                            
+                            filter.message = Data(string.utf8)
+                            filter.correctionLevel = "H"
+                            
+                            guard let outputImage = filter.outputImage else { return nil }
+                            
+                            let scaledImage = outputImage.transformed(by: CGAffineTransform(scaleX: 10, y: 10))
+                            
+                            guard let cgImage = context.createCGImage(scaledImage, from: scaledImage.extent) else {
+                                return nil
+                            }
+                            
+                            return UIImage(cgImage: cgImage)
+                        }
+                        
+                        func copyToClipboard() {
+                            guard let invoice = invoice else { return }
+                            UIPasteboard.general.string = invoice
+                            
+                            // Show feedback
+                            let generator = UINotificationFeedbackGenerator()
+                            generator.notificationOccurred(.success)
+                        }
+                        
+                        func formatExpiry(_ minutes: Int) -> String {
+                            if minutes < 60 {
+                                return "\(minutes) min"
+                            } else if minutes == 1440 {
+                                return "1 day"
+                            } else {
+                                return "\(minutes / 60) hrs"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Error Handling and Recovery") {
+        @ContentAndMedia {
+            Implement robust error handling for all wallet operations with user-friendly recovery options.
+            
+            Common error scenarios include:
+            - Connection failures
+            - Insufficient balance
+            - Invalid invoices
+            - Network timeouts
+            - Authentication issues
+            
+            @Image(source: error-handling.png, alt: "Error Handling Flow")
+        }
+        
+        @Steps {
+            @Step {
+                Create comprehensive error handling for NWC operations.
+                
+                @Code(name: "NWCErrorHandling.swift", file: nip47-10-errors.swift) {
+                    import SwiftUI
+                    import NostrKit
+                    
+                    // Enhanced error types for NWC operations
+                    enum NWCOperationError: LocalizedError {
+                        case connectionLost
+                        case insufficientBalance(required: Int64, available: Int64)
+                        case invoiceExpired
+                        case paymentTimeout
+                        case rateLimited(retryAfter: TimeInterval)
+                        case walletError(NWCError)
+                        case networkError(Error)
+                        
+                        var errorDescription: String? {
+                            switch self {
+                            case .connectionLost:
+                                return "Connection to wallet lost"
+                            case .insufficientBalance(let required, let available):
+                                return "Insufficient balance. Need \(required) sats, have \(available) sats"
+                            case .invoiceExpired:
+                                return "Invoice has expired"
+                            case .paymentTimeout:
+                                return "Payment timed out"
+                            case .rateLimited(let retryAfter):
+                                return "Too many requests. Try again in \(Int(retryAfter)) seconds"
+                            case .walletError(let error):
+                                return "Wallet error: \(error.message)"
+                            case .networkError(let error):
+                                return "Network error: \(error.localizedDescription)"
+                            }
+                        }
+                        
+                        var recoverySuggestion: String? {
+                            switch self {
+                            case .connectionLost:
+                                return "Check your internet connection and reconnect to wallet"
+                            case .insufficientBalance:
+                                return "Add funds to your wallet and try again"
+                            case .invoiceExpired:
+                                return "Request a new invoice from the recipient"
+                            case .paymentTimeout:
+                                return "Check with the recipient if payment was received"
+                            case .rateLimited:
+                                return "Wait a moment before trying again"
+                            case .walletError:
+                                return "Check wallet status or contact wallet support"
+                            case .networkError:
+                                return "Check your internet connection"
+                            }
+                        }
+                        
+                        var isRecoverable: Bool {
+                            switch self {
+                            case .invoiceExpired:
+                                return false
+                            default:
+                                return true
+                            }
+                        }
+                    }
+                    
+                    // Error recovery coordinator
+                    @MainActor
+                    class ErrorRecoveryCoordinator: ObservableObject {
+                        @Published var currentError: NWCOperationError?
+                        @Published var isRecovering = false
+                        @Published var recoveryProgress: Double = 0
+                        
+                        let walletManager: WalletConnectManager
+                        
+                        init(walletManager: WalletConnectManager) {
+                            self.walletManager = walletManager
+                        }
+                        
+                        func handleError(_ error: Error) {
+                            // Convert to NWC operation error
+                            if let nwcError = error as? NWCError {
+                                switch nwcError.code {
+                                case .insufficientBalance:
+                                    // Parse balance from error data if available
+                                    self.currentError = .walletError(nwcError)
+                                case .rateLimited:
+                                    self.currentError = .rateLimited(retryAfter: 60)
+                                default:
+                                    self.currentError = .walletError(nwcError)
+                                }
+                            } else if let urlError = error as? URLError {
+                                if urlError.code == .notConnectedToInternet {
+                                    self.currentError = .connectionLost
+                                } else {
+                                    self.currentError = .networkError(error)
+                                }
+                            } else {
+                                self.currentError = .networkError(error)
+                            }
+                        }
+                        
+                        func attemptRecovery() async {
+                            guard let error = currentError, error.isRecoverable else { return }
+                            
+                            isRecovering = true
+                            recoveryProgress = 0
+                            
+                            switch error {
+                            case .connectionLost:
+                                await recoverConnection()
+                            case .rateLimited(let retryAfter):
+                                await waitAndRetry(seconds: retryAfter)
+                            case .insufficientBalance:
+                                await checkBalanceUpdate()
+                            default:
+                                // Generic recovery attempt
+                                await genericRecovery()
+                            }
+                            
+                            isRecovering = false
+                        }
+                        
+                        private func recoverConnection() async {
+                            // Progress: 0-30% - Check network
+                            recoveryProgress = 0.1
+                            if !await checkNetworkConnectivity() {
+                                return
+                            }
+                            
+                            recoveryProgress = 0.3
+                            
+                            // Progress: 30-60% - Reconnect to relays
+                            do {
+                                try await walletManager.reconnect()
+                                recoveryProgress = 0.6
+                            } catch {
+                                print("Relay reconnection failed: \(error)")
+                                return
+                            }
+                            
+                            // Progress: 60-100% - Verify wallet connection
+                            recoveryProgress = 0.8
+                            
+                            // Test with get_info request
+                            do {
+                                _ = try await walletManager.getWalletInfo()
+                                recoveryProgress = 1.0
+                                currentError = nil // Clear error on success
+                            } catch {
+                                print("Wallet verification failed: \(error)")
+                            }
+                        }
+                        
+                        private func waitAndRetry(seconds: TimeInterval) async {
+                            let steps = Int(seconds)
+                            for i in 0..<steps {
+                                recoveryProgress = Double(i) / Double(steps)
+                                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                            }
+                            recoveryProgress = 1.0
+                            currentError = nil
+                        }
+                        
+                        private func checkBalanceUpdate() async {
+                            recoveryProgress = 0.5
+                            
+                            // Poll for balance update
+                            for _ in 0..<5 {
+                                if let balance = try? await walletManager.getBalance() {
+                                    if case .insufficientBalance(let required, _) = currentError {
+                                        if balance >= required {
+                                            currentError = nil
+                                            recoveryProgress = 1.0
+                                            return
+                                        }
+                                    }
+                                }
+                                
+                                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                recoveryProgress += 0.1
+                            }
+                        }
+                        
+                        private func genericRecovery() async {
+                            // Simple wait and clear
+                            for i in 0..<3 {
+                                recoveryProgress = Double(i) / 3.0
+                                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                            }
+                            recoveryProgress = 1.0
+                        }
+                        
+                        private func checkNetworkConnectivity() async -> Bool {
+                            // Check network reachability
+                            let url = URL(string: "https://google.com")!
+                            var request = URLRequest(url: url)
+                            request.httpMethod = "HEAD"
+                            request.timeoutInterval = 5
+                            
+                            do {
+                                let (_, response) = try await URLSession.shared.data(for: request)
+                                return (response as? HTTPURLResponse)?.statusCode == 200
+                            } catch {
+                                return false
+                            }
+                        }
+                    }
+                    
+                    // Error display view
+                    struct ErrorRecoveryView: View {
+                        @ObservedObject var coordinator: ErrorRecoveryCoordinator
+                        
+                        var body: some View {
+                            if let error = coordinator.currentError {
+                                VStack(spacing: 16) {
+                                    // Error icon
+                                    Image(systemName: errorIcon(for: error))
+                                        .font(.system(size: 50))
+                                        .foregroundColor(errorColor(for: error))
+                                    
+                                    // Error message
+                                    Text(error.localizedDescription)
+                                        .font(.headline)
+                                        .multilineTextAlignment(.center)
+                                    
+                                    // Recovery suggestion
+                                    if let suggestion = error.recoverySuggestion {
+                                        Text(suggestion)
+                                            .font(.subheadline)
+                                            .foregroundColor(.secondary)
+                                            .multilineTextAlignment(.center)
+                                    }
+                                    
+                                    // Recovery progress
+                                    if coordinator.isRecovering {
+                                        VStack {
+                                            ProgressView(value: coordinator.recoveryProgress)
+                                                .progressViewStyle(.linear)
+                                            
+                                            Text("Attempting recovery...")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    
+                                    // Action buttons
+                                    HStack(spacing: 12) {
+                                        if error.isRecoverable && !coordinator.isRecovering {
+                                            Button("Try Again") {
+                                                Task {
+                                                    await coordinator.attemptRecovery()
+                                                }
+                                            }
+                                            .buttonStyle(.borderedProminent)
+                                        }
+                                        
+                                        Button("Dismiss") {
+                                            coordinator.currentError = nil
+                                        }
+                                        .buttonStyle(.bordered)
+                                    }
+                                }
+                                .padding()
+                                .background(Color(.systemBackground))
+                                .cornerRadius(12)
+                                .shadow(radius: 5)
+                                .transition(.scale.combined(with: .opacity))
+                            }
+                        }
+                        
+                        func errorIcon(for error: NWCOperationError) -> String {
+                            switch error {
+                            case .connectionLost, .networkError:
+                                return "wifi.exclamationmark"
+                            case .insufficientBalance:
+                                return "creditcard.trianglebadge.exclamationmark"
+                            case .invoiceExpired, .paymentTimeout:
+                                return "clock.badge.xmark"
+                            case .rateLimited:
+                                return "hourglass"
+                            case .walletError:
+                                return "exclamationmark.triangle"
+                            }
+                        }
+                        
+                        func errorColor(for error: NWCOperationError) -> Color {
+                            switch error {
+                            case .insufficientBalance, .invoiceExpired:
+                                return .orange
+                            case .rateLimited:
+                                return .yellow
+                            default:
+                                return .red
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Section(title: "Security Best Practices") {
+        @ContentAndMedia {
+            Implement security measures to protect user funds and private data in your NIP-47 integration.
+            
+            Critical security considerations:
+            - Secure key storage
+            - Connection URI protection
+            - Amount limits and confirmations
+            - Audit logging
+            - Phishing prevention
+            
+            @Image(source: security-layers.png, alt: "Security Layers Diagram")
+        }
+        
+        @Steps {
+            @Step {
+                Implement secure storage for sensitive NWC data.
+                
+                @Code(name: "SecureNWCStorage.swift", file: nip47-11-security.swift) {
+                    import Security
+                    import CryptoKit
+                    import NostrKit
+                    
+                    // Secure storage for NWC connections
+                    actor SecureNWCStorage {
+                        private let keychainService = "com.app.nwc"
+                        private let encryptionKey: SymmetricKey
+                        
+                        init() throws {
+                            // Generate or load encryption key from Secure Enclave
+                            self.encryptionKey = try Self.getOrCreateEncryptionKey()
+                        }
+                        
+                        // Store connection securely
+                        func storeConnection(_ connection: NWCConnection) throws {
+                            // Encrypt sensitive data
+                            let sensitiveData = SensitiveConnectionData(
+                                secret: connection.secret,
+                                walletPubkey: connection.walletPubkey,
+                                relayURL: connection.relayURL
+                            )
+                            
+                            let jsonData = try JSONEncoder().encode(sensitiveData)
+                            let sealedBox = try AES.GCM.seal(jsonData, using: encryptionKey)
+                            
+                            // Store in keychain
+                            let query: [String: Any] = [
+                                kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrService as String: keychainService,
+                                kSecAttrAccount as String: connection.id,
+                                kSecValueData as String: sealedBox.combined!,
+                                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+                            ]
+                            
+                            let status = SecItemAdd(query as CFDictionary, nil)
+                            
+                            if status != errSecSuccess && status != errSecDuplicateItem {
+                                throw KeychainError.storeFailed(status)
+                            }
+                        }
+                        
+                        // Retrieve connection securely
+                        func loadConnection(id: String) throws -> SensitiveConnectionData {
+                            let query: [String: Any] = [
+                                kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrService as String: keychainService,
+                                kSecAttrAccount as String: id,
+                                kSecReturnData as String: true
+                            ]
+                            
+                            var result: AnyObject?
+                            let status = SecItemCopyMatching(query as CFDictionary, &result)
+                            
+                            guard status == errSecSuccess,
+                                  let data = result as? Data else {
+                                throw KeychainError.loadFailed(status)
+                            }
+                            
+                            // Decrypt data
+                            let sealedBox = try AES.GCM.SealedBox(combined: data)
+                            let decryptedData = try AES.GCM.open(sealedBox, using: encryptionKey)
+                            
+                            return try JSONDecoder().decode(
+                                SensitiveConnectionData.self,
+                                from: decryptedData
+                            )
+                        }
+                        
+                        // Delete connection
+                        func deleteConnection(id: String) throws {
+                            let query: [String: Any] = [
+                                kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrService as String: keychainService,
+                                kSecAttrAccount as String: id
+                            ]
+                            
+                            let status = SecItemDelete(query as CFDictionary)
+                            
+                            if status != errSecSuccess && status != errSecItemNotFound {
+                                throw KeychainError.deleteFailed(status)
+                            }
+                        }
+                        
+                        // Generate/retrieve encryption key
+                        private static func getOrCreateEncryptionKey() throws -> SymmetricKey {
+                            let keyTag = "com.app.nwc.encryptionKey"
+                            
+                            // Try to load existing key
+                            let loadQuery: [String: Any] = [
+                                kSecClass as String: kSecClassKey,
+                                kSecAttrApplicationTag as String: keyTag,
+                                kSecReturnData as String: true
+                            ]
+                            
+                            var result: AnyObject?
+                            let loadStatus = SecItemCopyMatching(loadQuery as CFDictionary, &result)
+                            
+                            if loadStatus == errSecSuccess, let keyData = result as? Data {
+                                return SymmetricKey(data: keyData)
+                            }
+                            
+                            // Generate new key
+                            let newKey = SymmetricKey(size: .bits256)
+                            
+                            // Store in keychain
+                            let storeQuery: [String: Any] = [
+                                kSecClass as String: kSecClassKey,
+                                kSecAttrApplicationTag as String: keyTag,
+                                kSecValueData as String: newKey.withUnsafeBytes { Data($0) },
+                                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+                            ]
+                            
+                            let storeStatus = SecItemAdd(storeQuery as CFDictionary, nil)
+                            
+                            if storeStatus != errSecSuccess {
+                                throw KeychainError.keyGenerationFailed
+                            }
+                            
+                            return newKey
+                        }
+                        
+                        struct SensitiveConnectionData: Codable {
+                            let secret: String
+                            let walletPubkey: String
+                            let relayURL: String
+                        }
+                        
+                        enum KeychainError: LocalizedError {
+                            case storeFailed(OSStatus)
+                            case loadFailed(OSStatus)
+                            case deleteFailed(OSStatus)
+                            case keyGenerationFailed
+                            
+                            var errorDescription: String? {
+                                switch self {
+                                case .storeFailed(let status):
+                                    return "Failed to store in keychain: \(status)"
+                                case .loadFailed(let status):
+                                    return "Failed to load from keychain: \(status)"
+                                case .deleteFailed(let status):
+                                    return "Failed to delete from keychain: \(status)"
+                                case .keyGenerationFailed:
+                                    return "Failed to generate encryption key"
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Payment limits and confirmations
+                    struct PaymentSecurityPolicy {
+                        let requireConfirmationAbove: Int64 = 10000 // sats
+                        let dailyLimit: Int64 = 100000 // sats
+                        let maxSinglePayment: Int64 = 50000 // sats
+                        let requireBiometricAbove: Int64 = 5000 // sats
+                        
+                        func validatePayment(amount: Int64, dailyTotal: Int64) throws {
+                            // Check single payment limit
+                            if amount > maxSinglePayment {
+                                throw SecurityError.exceedsMaxPayment(amount, maxSinglePayment)
+                            }
+                            
+                            // Check daily limit
+                            if dailyTotal + amount > dailyLimit {
+                                throw SecurityError.exceedsDailyLimit(dailyTotal + amount, dailyLimit)
+                            }
+                        }
+                        
+                        func requiresConfirmation(amount: Int64) -> Bool {
+                            amount > requireConfirmationAbove
+                        }
+                        
+                        func requiresBiometric(amount: Int64) -> Bool {
+                            amount > requireBiometricAbove
+                        }
+                        
+                        enum SecurityError: LocalizedError {
+                            case exceedsMaxPayment(Int64, Int64)
+                            case exceedsDailyLimit(Int64, Int64)
+                            
+                            var errorDescription: String? {
+                                switch self {
+                                case .exceedsMaxPayment(let amount, let max):
+                                    return "Payment of \(amount) sats exceeds maximum of \(max) sats"
+                                case .exceedsDailyLimit(let total, let limit):
+                                    return "Total of \(total) sats exceeds daily limit of \(limit) sats"
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Audit logging
+                    actor AuditLogger {
+                        private let logFileURL: URL
+                        
+                        init() {
+                            let documentsPath = FileManager.default.urls(
+                                for: .documentDirectory,
+                                in: .userDomainMask
+                            )[0]
+                            self.logFileURL = documentsPath.appendingPathComponent("nwc_audit.log")
+                        }
+                        
+                        func logPayment(
+                            invoice: String,
+                            amount: Int64,
+                            wallet: String,
+                            result: PaymentResult?,
+                            error: Error?
+                        ) {
+                            let entry = AuditEntry(
+                                timestamp: Date(),
+                                type: .payment,
+                                details: [
+                                    "invoice_hash": invoice.prefix(20) + "...",
+                                    "amount": String(amount),
+                                    "wallet": wallet,
+                                    "success": result != nil ? "true" : "false",
+                                    "error": error?.localizedDescription ?? ""
+                                ]
+                            )
+                            
+                            Task {
+                                await writeEntry(entry)
+                            }
+                        }
+                        
+                        func logConnection(
+                            wallet: String,
+                            action: ConnectionAction
+                        ) {
+                            let entry = AuditEntry(
+                                timestamp: Date(),
+                                type: .connection,
+                                details: [
+                                    "wallet": wallet,
+                                    "action": action.rawValue
+                                ]
+                            )
+                            
+                            Task {
+                                await writeEntry(entry)
+                            }
+                        }
+                        
+                        private func writeEntry(_ entry: AuditEntry) async {
+                            do {
+                                let encoder = JSONEncoder()
+                                encoder.dateEncodingStrategy = .iso8601
+                                let data = try encoder.encode(entry)
+                                
+                                if FileManager.default.fileExists(atPath: logFileURL.path) {
+                                    let handle = try FileHandle(forWritingTo: logFileURL)
+                                    try handle.seekToEnd()
+                                    handle.write(data)
+                                    handle.write("\n".data(using: .utf8)!)
+                                    try handle.close()
+                                } else {
+                                    try data.write(to: logFileURL)
+                                }
+                            } catch {
+                                print("Audit log failed: \(error)")
+                            }
+                        }
+                        
+                        struct AuditEntry: Codable {
+                            let timestamp: Date
+                            let type: EntryType
+                            let details: [String: String]
+                            
+                            enum EntryType: String, Codable {
+                                case payment
+                                case connection
+                                case error
+                            }
+                        }
+                        
+                        enum ConnectionAction: String {
+                            case connected
+                            case disconnected
+                            case failed
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    @Assessments {
+        @MultipleChoice {
+            What encryption method does NIP-47 prefer for secure communication?
+            
+            @Choice(isCorrect: false) {
+                NIP-04 (deprecated AES encryption)
+                
+                @Justification {
+                    NIP-04 is supported for backwards compatibility but has known vulnerabilities. NIP-44 is preferred.
+                }
+            }
+            
+            @Choice(isCorrect: true) {
+                NIP-44 (XChaCha20-Poly1305)
+                
+                @Justification {
+                    Correct! NIP-44 uses XChaCha20-Poly1305 for authenticated encryption and is the recommended method.
+                }
+            }
+            
+            @Choice(isCorrect: false) {
+                Plain text with signature
+                
+                @Justification {
+                    NWC messages must be encrypted, not just signed, to protect payment information.
+                }
+            }
+        }
+        
+        @MultipleChoice {
+            Which event kind is used for wallet notifications like incoming payments?
+            
+            @Choice(isCorrect: false) {
+                23195
+                
+                @Justification {
+                    Event kind 23195 is for responses to requests, not notifications.
+                }
+            }
+            
+            @Choice(isCorrect: false) {
+                23196
+                
+                @Justification {
+                    Event kind 23196 was the legacy notification kind, now deprecated.
+                }
+            }
+            
+            @Choice(isCorrect: true) {
+                23197
+                
+                @Justification {
+                    Correct! Event kind 23197 is used for wallet notifications including incoming payments and balance updates.
+                }
+            }
+        }
+        
+        @MultipleChoice {
+            What information is required in a NIP-47 connection URI?
+            
+            @Choice(isCorrect: false) {
+                Only the wallet public key
+                
+                @Justification {
+                    The connection URI requires more than just the public key to establish communication.
+                }
+            }
+            
+            @Choice(isCorrect: true) {
+                Wallet pubkey, relay URL, and shared secret
+                
+                @Justification {
+                    Correct! These three components are essential: pubkey identifies the wallet, relay enables communication, and secret encrypts messages.
+                }
+            }
+            
+            @Choice(isCorrect: false) {
+                Lightning node URI and macaroon
+                
+                @Justification {
+                    NIP-47 abstracts away Lightning node details. Direct node access is not required.
+                }
+            }
+        }
+    }
+}
