@@ -15,24 +15,30 @@ extension RelayPool {
     ) async throws -> [NostrEvent] {
         let subscriptionId = UUID().uuidString
         let subscription = try await subscribe(filters: filters, id: subscriptionId)
-        
-        var events: [NostrEvent] = []
-        
-        // Create a task that collects events
-        let collectTask = Task {
+
+        // Use an actor to safely collect events across concurrency domains
+        actor EventCollector {
+            private(set) var items: [NostrEvent] = []
+            func append(_ event: NostrEvent) { items.append(event) }
+        }
+        let collector = EventCollector()
+
+        // Create a task that collects events without sharing mutable state
+        let collectTask = Task { @Sendable in
             for await event in await subscription.events {
-                events.append(event)
+                await collector.append(event)
             }
         }
-        
+
         // Wait for timeout
         try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-        
+
         // Close subscription and cancel collection
         await closeSubscription(id: subscriptionId)
         collectTask.cancel()
-        
-        return events
+
+        // Return the collected events
+        return await collector.items
     }
     
     /// Publishes an event to all connected relays
@@ -79,3 +85,4 @@ extension NostrError {
 }
 
 /// Extension to EventCache for simpler API
+
