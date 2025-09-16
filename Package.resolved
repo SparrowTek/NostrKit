@@ -1,5 +1,5 @@
 {
-  "originHash" : "aac5162132878ee9003254b0717baaa5cfd33e658a2a466d5023478d22517cb7",
+  "originHash" : "7db02637e29ab173ca3bdb012153a7ca1efbac19e35972f677ee16748bbca3d1",
   "pins" : [
     {
       "identity" : "bdk-swift",
@@ -17,6 +17,15 @@
       "state" : {
         "revision" : "e07e00fa1fd435143a2dcf8b7eec9a7710b2fdfe",
         "version" : "5.7.0"
+      }
+    },
+    {
+      "identity" : "corenostr",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/SparrowTek/CoreNostr.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "27f63ad10812a0ded5e255fa75c9a9ed13ae6d30"
       }
     },
     {
