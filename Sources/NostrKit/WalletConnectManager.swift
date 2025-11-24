@@ -8,6 +8,68 @@
 import Foundation
 import CoreNostr
 import Combine
+import OSLog
+
+// MARK: - RelayPool Conformance
+
+extension RelayPool: WalletRelayPool {
+    func addRelay(url: String) async throws {
+        _ = try addRelay(url: url)
+    }
+    
+    func walletSubscribe(filters: [Filter], id: String?) async throws -> WalletSubscription {
+        let poolSubscription = try await subscribe(filters: filters, id: id)
+        let stream = await poolSubscription.events
+        return WalletSubscription(id: poolSubscription.id, events: stream)
+    }
+}
+
+// MARK: - Supporting Types
+
+protocol WalletRelayPool: Actor {
+    func addRelay(url: String) async throws
+    func connectAll() async
+    func publish(_ event: NostrEvent) async -> [RelayPool.PublishResult]
+    func walletSubscribe(filters: [Filter], id: String?) async throws -> WalletSubscription
+    func closeSubscription(id: String) async
+}
+
+/// Minimal subscription wrapper to decouple WalletConnectManager from the underlying relay pool implementation.
+public struct WalletSubscription {
+    public let id: String
+    public let events: AsyncStream<NostrEvent>
+}
+
+/// Simple token bucket rate limiter used to throttle NWC requests per wallet.
+private struct NWCRateLimiter {
+    private let maxTokens: Double
+    private let refillInterval: TimeInterval
+    private var availableTokens: Double
+    private var lastRefill: Date
+    
+    init(maxRequestsPerMinute: Int) {
+        self.maxTokens = Double(maxRequestsPerMinute)
+        self.refillInterval = 60.0
+        self.availableTokens = Double(maxRequestsPerMinute)
+        self.lastRefill = Date()
+    }
+    
+    mutating func consume() -> Bool {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastRefill)
+        if elapsed > 0 {
+            let refill = (elapsed / refillInterval) * maxTokens
+            availableTokens = min(maxTokens, availableTokens + refill)
+            lastRefill = now
+        }
+        
+        if availableTokens >= 1 {
+            availableTokens -= 1
+            return true
+        }
+        return false
+    }
+}
 
 /// Manages Lightning wallet connections using the Nostr Wallet Connect protocol (NIP-47).
 ///
@@ -194,11 +256,14 @@ public class WalletConnectManager: ObservableObject {
     // MARK: - Private Properties
     
     private let keychain: KeychainWrapper
-    private let relayPool: RelayPool
+    private let relayPool: any WalletRelayPool
     private var subscriptions: [String: String] = [:] // requestId -> subscriptionId
     private var pendingRequests: [String: CheckedContinuation<NostrEvent, Error>] = [:]
     private var notificationSubscription: String?
     private var cancellables = Set<AnyCancellable>()
+    private var processedResponses: Set<String> = []
+    private var processedNotifications: Set<String> = []
+    private var rateLimiter: NWCRateLimiter
     
     // MARK: - Constants
     
@@ -214,12 +279,28 @@ public class WalletConnectManager: ObservableObject {
     /// on initialization. No manual setup is required.
     ///
     /// - Note: The manager must be used on the main actor for SwiftUI compatibility.
-    public init() {
-        self.keychain = KeychainWrapper(service: Self.keychainService)
-        self.relayPool = RelayPool()
+    public init(
+        relayPool: any WalletRelayPool = RelayPool(),
+        keychain: KeychainWrapper = KeychainWrapper(service: Self.keychainService),
+        seedConnections: [WalletConnection]? = nil,
+        activeConnectionId: String? = nil,
+        maxRequestsPerMinute: Int = 30
+    ) {
+        self.keychain = keychain
+        self.relayPool = relayPool
+        self.rateLimiter = NWCRateLimiter(maxRequestsPerMinute: maxRequestsPerMinute)
         
-        Task {
-            await loadConnections()
+        if let seedConnections {
+            self.connections = seedConnections
+            if let activeId = activeConnectionId {
+                self.activeConnection = seedConnections.first(where: { $0.id == activeId })
+            } else {
+                self.activeConnection = seedConnections.first
+            }
+        } else {
+            Task {
+                await loadConnections()
+            }
         }
     }
     
@@ -509,6 +590,10 @@ public class WalletConnectManager: ObservableObject {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
         }
+        guard supportsMethod(.payInvoice) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support pay_invoice")
+        }
+        try enforceRateLimit()
         
         isLoading = true
         defer { isLoading = false }
@@ -523,7 +608,8 @@ public class WalletConnectManager: ObservableObject {
             method: .payInvoice,
             params: params,
             walletPubkey: connection.uri.walletPubkey,
-            clientSecret: connection.uri.secret
+            clientSecret: connection.uri.secret,
+            encryption: try resolveEncryption()
         )
         
         // Send request and wait for response
@@ -550,8 +636,8 @@ public class WalletConnectManager: ObservableObject {
         let paymentHash = result["payment_hash"]?.value as? String
         
         // Update last used timestamp
-        if var conn = connections.first(where: { $0.id == connection.id }) {
-            conn.lastUsedAt = Date()
+        if let idx = connections.firstIndex(where: { $0.id == connection.id }) {
+            connections[idx].lastUsedAt = Date()
             await saveConnections()
         }
         
@@ -590,6 +676,10 @@ public class WalletConnectManager: ObservableObject {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
         }
+        guard supportsMethod(.getBalance) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support balance queries")
+        }
+        try enforceRateLimit()
         
         isLoading = true
         defer { isLoading = false }
@@ -597,7 +687,8 @@ public class WalletConnectManager: ObservableObject {
         let requestEvent = try NostrEvent.nwcRequest(
             method: .getBalance,
             walletPubkey: connection.uri.walletPubkey,
-            clientSecret: connection.uri.secret
+            clientSecret: connection.uri.secret,
+            encryption: try resolveEncryption()
         )
         
         let response = try await sendRequestAndWaitForResponse(requestEvent)
@@ -659,6 +750,10 @@ public class WalletConnectManager: ObservableObject {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
         }
+        guard supportsMethod(.makeInvoice) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support invoice creation")
+        }
+        try enforceRateLimit()
         
         isLoading = true
         defer { isLoading = false }
@@ -675,7 +770,8 @@ public class WalletConnectManager: ObservableObject {
             method: .makeInvoice,
             params: params,
             walletPubkey: connection.uri.walletPubkey,
-            clientSecret: connection.uri.secret
+            clientSecret: connection.uri.secret,
+            encryption: try resolveEncryption()
         )
         
         let response = try await sendRequestAndWaitForResponse(requestEvent)
@@ -739,6 +835,10 @@ public class WalletConnectManager: ObservableObject {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
         }
+        guard supportsMethod(.listTransactions) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support transaction listing")
+        }
+        try enforceRateLimit()
         
         isLoading = true
         defer { isLoading = false }
@@ -758,7 +858,8 @@ public class WalletConnectManager: ObservableObject {
             method: .listTransactions,
             params: params,
             walletPubkey: connection.uri.walletPubkey,
-            clientSecret: connection.uri.secret
+            clientSecret: connection.uri.secret,
+            encryption: try resolveEncryption()
         )
         
         let response = try await sendRequestAndWaitForResponse(requestEvent)
@@ -791,6 +892,27 @@ public class WalletConnectManager: ObservableObject {
     
     // MARK: - Private Methods
     
+    private func enforceRateLimit() throws {
+        guard rateLimiter.consume() else {
+            throw NWCError(code: .rateLimited, message: "Too many wallet requests. Please wait.")
+        }
+    }
+    
+    private func resolveEncryption() throws -> NWCEncryption {
+        guard let capabilities = activeConnection?.capabilities else {
+            return .nip44
+        }
+        
+        if capabilities.encryptionSchemes.contains(.nip44) {
+            return .nip44
+        }
+        if capabilities.encryptionSchemes.contains(.nip04) {
+            return .nip04
+        }
+        
+        throw NWCError(code: .unsupportedEncryption, message: "Wallet does not support a compatible encryption scheme")
+    }
+    
     private func fetchWalletInfo(walletPubkey: String) async throws -> NWCInfo? {
         // Create filter for info event
         let filter = Filter(
@@ -800,7 +922,7 @@ public class WalletConnectManager: ObservableObject {
         )
         
         // Subscribe and collect info event
-        let subscription = try await relayPool.subscribe(
+        let subscription = try await relayPool.walletSubscribe(
             filters: [filter],
             id: "nwc-info-\(UUID().uuidString)"
         )
@@ -828,6 +950,15 @@ public class WalletConnectManager: ObservableObject {
     }
     
     private func sendRequestAndWaitForResponse(_ request: NostrEvent) async throws -> NostrEvent {
+        guard let connection = activeConnection else {
+            throw NWCError(code: .unauthorized, message: "No active wallet connection")
+        }
+        
+        nwcLogger.debug("Publishing NWC request", metadata: LogMetadata([
+            "request_id": request.id,
+            "wallet": connection.uri.walletPubkey
+        ]))
+        
         // Publish request
         let publishResults = await relayPool.publish(request)
         
@@ -838,7 +969,7 @@ public class WalletConnectManager: ObservableObject {
         
         // Subscribe to responses
         let filter = Filter(
-            authors: [activeConnection?.uri.walletPubkey ?? ""],
+            authors: [connection.uri.walletPubkey],
             kinds: [EventKind.nwcResponse.rawValue],
             e: [request.id]
         )
@@ -847,7 +978,7 @@ public class WalletConnectManager: ObservableObject {
         return try await withCheckedThrowingContinuation { continuation in
             Task {
                 do {
-                    let subscription = try await relayPool.subscribe(filters: [filter])
+                    let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
                     subscriptions[request.id] = subscription.id
                     
                     // Set up timeout
@@ -863,14 +994,21 @@ public class WalletConnectManager: ObservableObject {
                     pendingRequests[request.id] = continuation
                     
                     // Listen for response
-                    for await event in await subscription.events {
-                        if event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == request.id }) {
-                            pendingRequests.removeValue(forKey: request.id)
-                            await relayPool.closeSubscription(id: subscription.id)
-                            subscriptions.removeValue(forKey: request.id)
-                            continuation.resume(returning: event)
-                            break
+                    for await event in subscription.events {
+                        guard !processedResponses.contains(event.id) else { continue }
+                        guard event.pubkey == connection.uri.walletPubkey else { continue }
+                        guard event.kind == EventKind.nwcResponse.rawValue else { continue }
+                        
+                        guard event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == request.id }) else {
+                            continue
                         }
+                        
+                        processedResponses.insert(event.id)
+                        pendingRequests.removeValue(forKey: request.id)
+                        await relayPool.closeSubscription(id: subscription.id)
+                        subscriptions.removeValue(forKey: request.id)
+                        continuation.resume(returning: event)
+                        break
                     }
                 } catch {
                     pendingRequests.removeValue(forKey: request.id)
@@ -889,8 +1027,10 @@ public class WalletConnectManager: ObservableObject {
             return
         }
         
-        // Subscribe to notification events
-        let clientPubkey = try! KeyPair(privateKey: connection.uri.secret).publicKey
+        guard let clientPubkey = try? KeyPair(privateKey: connection.uri.secret).publicKey else {
+            nwcLogger.error("Failed to derive client pubkey for notifications")
+            return
+        }
         let filter = Filter(
             authors: [connection.uri.walletPubkey],
             kinds: [EventKind.nwcNotification.rawValue, EventKind.nwcNotificationLegacy.rawValue],
@@ -898,21 +1038,25 @@ public class WalletConnectManager: ObservableObject {
         )
         
         do {
-            let subscription = try await relayPool.subscribe(filters: [filter])
+            let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
             notificationSubscription = subscription.id
             
             Task {
-                for await event in await subscription.events {
+                for await event in subscription.events {
                     await handleNotification(event)
                 }
             }
         } catch {
-            print("Failed to subscribe to notifications: \(error)")
+            nwcLogger.error("Failed to subscribe to notifications", error: error)
         }
     }
     
     private func handleNotification(_ event: NostrEvent) async {
         guard let connection = activeConnection else { return }
+        
+        guard !processedNotifications.contains(event.id) else { return }
+        guard event.pubkey == connection.uri.walletPubkey else { return }
+        processedNotifications.insert(event.id)
         
         do {
             let decryptedContent = try event.decryptNWCContent(
@@ -925,19 +1069,19 @@ public class WalletConnectManager: ObservableObject {
             // Handle different notification types
             switch notification.notificationType {
             case .paymentReceived:
-                print("Payment received notification")
+                nwcLogger.info("Payment received notification", metadata: LogMetadata(["wallet": connection.uri.walletPubkey]))
                 // Update balance
                 _ = try? await getBalance()
                 
             case .paymentSent:
-                print("Payment sent notification")
+                nwcLogger.info("Payment sent notification", metadata: LogMetadata(["wallet": connection.uri.walletPubkey]))
                 // Update balance and transaction list
                 _ = try? await getBalance()
                 _ = try? await listTransactions(limit: 10)
             }
             
         } catch {
-            print("Failed to handle notification: \(error)")
+            nwcLogger.error("Failed to handle notification", error: error)
         }
     }
     

@@ -21,12 +21,14 @@ struct MockSubscriptionResult {
     let events: AsyncStream<NostrEvent>
 }
 
-actor MockRelayPool: RelayPoolProtocol {
+actor MockRelayPool: RelayPoolProtocol, WalletRelayPool {
     private var mockEvents: [NostrEvent] = []
     private var mockRelays: [URL: MockRelayService] = [:]
     private var activeSubscriptions: [String: MockSubscription] = [:]
     private var shouldFailPublish = false
     private var publishDelay: TimeInterval = 0.01
+    private var responseFactory: ((NostrEvent) -> NostrEvent?)?
+    private(set) var publishedEvents: [NostrEvent] = []
     
     struct MockSubscription {
         let id: String
@@ -49,6 +51,17 @@ actor MockRelayPool: RelayPoolProtocol {
         publishDelay = delay
     }
     
+    func setResponseFactory(_ factory: @escaping (NostrEvent) -> NostrEvent?) {
+        responseFactory = factory
+    }
+    
+    func addRelay(url: String) async throws {
+        guard let parsed = URL(string: url) else {
+            throw NostrError.invalidURI(uri: url, reason: "Invalid mock relay URL")
+        }
+        try await addRelay(parsed)
+    }
+    
     func addRelay(_ url: URL) async throws {
         let mockRelay = MockRelayService(url: url)
         await mockRelay.setMockEvents(mockEvents)
@@ -63,30 +76,63 @@ actor MockRelayPool: RelayPoolProtocol {
         }
     }
     
-    func publish(_ event: NostrEvent) async -> [(relayURL: URL, success: Bool, error: Error?)] {
-        var results: [(relayURL: URL, success: Bool, error: Error?)] = []
+    nonisolated func connectAll() async {
+        // Mocks eagerly connect in addRelay
+    }
+    
+    func publish(_ event: NostrEvent) async -> [RelayPool.PublishResult] {
+        var results: [RelayPool.PublishResult] = []
+        publishedEvents.append(event)
         
         // Simulate publish delay
         try? await Task.sleep(nanoseconds: UInt64(publishDelay * 1_000_000_000))
         
         if shouldFailPublish {
             for url in mockRelays.keys {
-                results.append((
-                    relayURL: url,
-                    success: false,
-                    error: NostrError.networkError(
-                        operation: .send,
-                        reason: "Mock publish failure"
+                results.append(
+                    RelayPool.PublishResult(
+                        relay: url.absoluteString,
+                        success: false,
+                        message: nil,
+                        error: NostrError.networkError(
+                            operation: .send,
+                            reason: "Mock publish failure"
+                        )
                     )
-                ))
+                )
             }
         } else {
             for (url, relay) in mockRelays {
                 do {
                     try await relay.send(.event(event))
-                    results.append((relayURL: url, success: true, error: nil))
+                    
+                    if let response = responseFactory?(event) {
+                        for (id, subscription) in activeSubscriptions {
+                            if matchesAnyFilter(event: response, filters: subscription.filters) {
+                                subscription.continuation.yield(response)
+                            }
+                            // Keep stream open for further events
+                            activeSubscriptions[id] = subscription
+                        }
+                    }
+                    
+                    results.append(
+                        RelayPool.PublishResult(
+                            relay: url.absoluteString,
+                            success: true,
+                            message: nil,
+                            error: nil
+                        )
+                    )
                 } catch {
-                    results.append((relayURL: url, success: false, error: error))
+                    results.append(
+                        RelayPool.PublishResult(
+                            relay: url.absoluteString,
+                            success: false,
+                            message: nil,
+                            error: error
+                        )
+                    )
                 }
             }
         }
@@ -125,6 +171,12 @@ actor MockRelayPool: RelayPoolProtocol {
             filters: filters,
             events: stream
         )
+    }
+    
+    func walletSubscribe(filters: [Filter], id: String? = nil) async throws -> WalletSubscription {
+        let subId = id ?? UUID().uuidString
+        let subscription = try await subscribe(filters: filters, id: subId)
+        return WalletSubscription(id: subscription.id, events: subscription.events)
     }
     
     func closeSubscription(id: String) async {
