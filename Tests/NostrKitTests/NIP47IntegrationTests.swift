@@ -1,10 +1,30 @@
 import Testing
+import Foundation
 import CoreNostr
 @testable import NostrKit
 
 @MainActor
 @Suite("NIP-47 WalletConnectManager Integration (mocked relays)")
 struct NIP47IntegrationTests {
+    
+    actor InMemoryWalletStorage: WalletStorage {
+        private var store: [String: Data] = [:]
+        
+        func store(_ data: Data, forKey key: String) async throws {
+            self.store[key] = data
+        }
+        
+        func load(key: String) async throws -> Data {
+            guard let data = store[key] else {
+                throw NostrError.notFound(resource: key)
+            }
+            return data
+        }
+        
+        func remove(key: String) async throws {
+            store.removeValue(forKey: key)
+        }
+    }
     
     private func makeConnections(walletPubkey: String, clientSecret: String) -> WalletConnectManager.WalletConnection {
         let uri = NWCConnectionURI(
@@ -32,8 +52,9 @@ struct NIP47IntegrationTests {
         let clientKeyPair = try KeyPair.generate()
         
         let mockPool = MockRelayPool()
+        let storage = InMemoryWalletStorage()
         
-        mockPool.setResponseFactory { request in
+        await mockPool.setResponseFactory { request in
             // Only respond to NWC requests
             guard request.kind == EventKind.nwcRequest.rawValue else { return nil }
             return try? NostrEvent.nwcResponse(
@@ -41,10 +62,10 @@ struct NIP47IntegrationTests {
                 resultType: "pay_invoice",
                 result: [
                     "preimage": AnyCodable("deadbeef"),
-                    "fees_paid": AnyCodable(123)
+                    "fees_paid": AnyCodable(Int64(123))
                 ],
                 clientPubkey: clientKeyPair.publicKey,
-                walletSecret: clientKeyPair.privateKey,
+                walletSecret: walletKeyPair.privateKey,
                 encryption: .nip44
             )
         }
@@ -52,7 +73,7 @@ struct NIP47IntegrationTests {
         let connection = makeConnections(walletPubkey: walletKeyPair.publicKey, clientSecret: clientKeyPair.privateKey)
         let manager = WalletConnectManager(
             relayPool: mockPool,
-            keychain: KeychainWrapper(service: "test.nwc"),
+            keychain: storage,
             seedConnections: [connection],
             activeConnectionId: connection.id,
             maxRequestsPerMinute: 10
@@ -72,13 +93,14 @@ struct NIP47IntegrationTests {
         let clientKeyPair = try KeyPair.generate()
         
         let mockPool = MockRelayPool()
-        mockPool.setResponseFactory { request in
+        let storage = InMemoryWalletStorage()
+        await mockPool.setResponseFactory { request in
             try? NostrEvent.nwcResponse(
                 requestId: request.id,
                 resultType: "pay_invoice",
                 result: ["preimage": AnyCodable("p1")],
                 clientPubkey: clientKeyPair.publicKey,
-                walletSecret: clientKeyPair.privateKey,
+                walletSecret: walletKeyPair.privateKey,
                 encryption: .nip44
             )
         }
@@ -86,7 +108,7 @@ struct NIP47IntegrationTests {
         let connection = makeConnections(walletPubkey: walletKeyPair.publicKey, clientSecret: clientKeyPair.privateKey)
         let manager = WalletConnectManager(
             relayPool: mockPool,
-            keychain: KeychainWrapper(service: "test.nwc"),
+            keychain: storage,
             seedConnections: [connection],
             activeConnectionId: connection.id,
             maxRequestsPerMinute: 1

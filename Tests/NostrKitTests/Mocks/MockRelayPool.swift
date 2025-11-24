@@ -6,7 +6,7 @@ import CoreNostr
 protocol RelayPoolProtocol {
     func addRelay(_ url: URL) async throws
     func removeRelay(_ url: URL) async
-    func publish(_ event: NostrEvent) async -> [(relayURL: URL, success: Bool, error: Error?)]
+    func publish(_ event: NostrEvent) async -> [NostrKit.RelayPool.PublishResult]
     func subscribe(filters: [Filter], id: String) async throws -> MockSubscriptionResult
     func closeSubscription(id: String) async
     func closeAllSubscriptions() async
@@ -27,7 +27,7 @@ actor MockRelayPool: RelayPoolProtocol, WalletRelayPool {
     private var activeSubscriptions: [String: MockSubscription] = [:]
     private var shouldFailPublish = false
     private var publishDelay: TimeInterval = 0.01
-    private var responseFactory: ((NostrEvent) -> NostrEvent?)?
+    private var responseFactory: (@Sendable (NostrEvent) -> NostrEvent?)?
     private(set) var publishedEvents: [NostrEvent] = []
     
     struct MockSubscription {
@@ -51,7 +51,7 @@ actor MockRelayPool: RelayPoolProtocol, WalletRelayPool {
         publishDelay = delay
     }
     
-    func setResponseFactory(_ factory: @escaping (NostrEvent) -> NostrEvent?) {
+    func setResponseFactory(_ factory: @Sendable @escaping (NostrEvent) -> NostrEvent?) {
         responseFactory = factory
     }
     

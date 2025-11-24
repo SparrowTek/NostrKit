@@ -24,7 +24,29 @@ extension RelayPool: WalletRelayPool {
     }
 }
 
+// MARK: - KeychainWrapper conformance
+
+extension KeychainWrapper: WalletStorage {
+    func store(_ data: Data, forKey key: String) async throws {
+        try self.save(data, forKey: key, requiresBiometrics: false)
+    }
+    
+    func load(key: String) async throws -> Data {
+        try self.load(key: key, context: nil)
+    }
+    
+    func remove(key: String) async throws {
+        try self.delete(key: key)
+    }
+}
+
 // MARK: - Supporting Types
+
+protocol WalletStorage: Actor {
+    func store(_ data: Data, forKey key: String) async throws
+    func load(key: String) async throws -> Data
+    func remove(key: String) async throws
+}
 
 protocol WalletRelayPool: Actor {
     func addRelay(url: String) async throws
@@ -256,7 +278,7 @@ public class WalletConnectManager: ObservableObject {
     
     // MARK: - Private Properties
     
-    private let keychain: KeychainWrapper
+    private let keychain: any WalletStorage
     private let relayPool: any WalletRelayPool
     private var subscriptions: [String: String] = [:] // requestId -> subscriptionId
     private var pendingRequests: [String: CheckedContinuation<NostrEvent, Error>] = [:]
@@ -293,7 +315,7 @@ public class WalletConnectManager: ObservableObject {
     // Internal initializer for testing/custom injection
     init(
         relayPool: any WalletRelayPool,
-        keychain: KeychainWrapper,
+        keychain: any WalletStorage,
         seedConnections: [WalletConnection]? = nil,
         activeConnectionId: String? = nil,
         maxRequestsPerMinute: Int = 30
@@ -640,7 +662,15 @@ public class WalletConnectManager: ObservableObject {
             throw NWCError(code: .other, message: "Invalid response format")
         }
         
-        let feesPaid = result["fees_paid"]?.value as? Int64
+        let feesValue = result["fees_paid"]?.value
+        let feesPaid: Int64?
+        if let int64 = feesValue as? Int64 {
+            feesPaid = int64
+        } else if let intVal = feesValue as? Int {
+            feesPaid = Int64(intVal)
+        } else {
+            feesPaid = nil
+        }
         let paymentHash = result["payment_hash"]?.value as? String
         
         // Update last used timestamp
@@ -967,60 +997,56 @@ public class WalletConnectManager: ObservableObject {
             "wallet": connection.uri.walletPubkey
         ]))
         
-        // Publish request
-        let publishResults = await relayPool.publish(request)
-        
-        // Check if at least one relay accepted the event
-        guard publishResults.contains(where: { $0.success }) else {
-            throw NWCError(code: .other, message: "Failed to publish request to any relay")
-        }
-        
-        // Subscribe to responses
+        // Prepare subscription first to avoid missing early responses
         let filter = Filter(
             authors: [connection.uri.walletPubkey],
             kinds: [EventKind.nwcResponse.rawValue],
             e: [request.id]
         )
         
+        let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
+        subscriptions[request.id] = subscription.id
+        
+        // Publish request
+        let publishResults = await relayPool.publish(request)
+        
+        // Check if at least one relay accepted the event
+        guard publishResults.contains(where: { $0.success }) else {
+            await relayPool.closeSubscription(id: subscription.id)
+            throw NWCError(code: .other, message: "Failed to publish request to any relay")
+        }
+
         // Wait for response with timeout
         return try await withCheckedThrowingContinuation { continuation in
             Task {
-                do {
-                    let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
-                    subscriptions[request.id] = subscription.id
-                    
-                    // Set up timeout
-                    Task {
-                        try await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
-                        if pendingRequests[request.id] != nil {
-                            pendingRequests.removeValue(forKey: request.id)
-                            continuation.resume(throwing: RelayError.timeout)
-                        }
-                    }
-                    
-                    // Store continuation
-                    pendingRequests[request.id] = continuation
-                    
-                    // Listen for response
-                    for await event in subscription.events {
-                        guard !processedResponses.contains(event.id) else { continue }
-                        guard event.pubkey == connection.uri.walletPubkey else { continue }
-                        guard event.kind == EventKind.nwcResponse.rawValue else { continue }
-                        
-                        guard event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == request.id }) else {
-                            continue
-                        }
-                        
-                        processedResponses.insert(event.id)
+                // Set up timeout
+                Task {
+                    try await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
+                    if pendingRequests[request.id] != nil {
                         pendingRequests.removeValue(forKey: request.id)
-                        await relayPool.closeSubscription(id: subscription.id)
-                        subscriptions.removeValue(forKey: request.id)
-                        continuation.resume(returning: event)
-                        break
+                        continuation.resume(throwing: RelayError.timeout)
                     }
-                } catch {
+                }
+                
+                // Store continuation
+                pendingRequests[request.id] = continuation
+                
+                // Listen for response
+                for await event in subscription.events {
+                    guard !processedResponses.contains(event.id) else { continue }
+                    guard event.pubkey == connection.uri.walletPubkey else { continue }
+                    guard event.kind == EventKind.nwcResponse.rawValue else { continue }
+                    
+                    guard event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == request.id }) else {
+                        continue
+                    }
+                    
+                    processedResponses.insert(event.id)
                     pendingRequests.removeValue(forKey: request.id)
-                    continuation.resume(throwing: error)
+                    await relayPool.closeSubscription(id: subscription.id)
+                    subscriptions.removeValue(forKey: request.id)
+                    continuation.resume(returning: event)
+                    break
                 }
             }
         }
@@ -1114,7 +1140,7 @@ public class WalletConnectManager: ObservableObject {
     private func saveConnections() async {
         do {
             let data = try JSONEncoder().encode(connections)
-            try await keychain.save(data, forKey: Self.connectionsKey)
+            try await keychain.store(data, forKey: Self.connectionsKey)
         } catch {
             print("Failed to save connections: \(error)")
         }
@@ -1124,9 +1150,9 @@ public class WalletConnectManager: ObservableObject {
         do {
             if let activeId = activeConnection?.id,
                let data = activeId.data(using: .utf8) {
-                try await keychain.save(data, forKey: Self.activeConnectionKey)
+                try await keychain.store(data, forKey: Self.activeConnectionKey)
             } else {
-                try await keychain.delete(key: Self.activeConnectionKey)
+                try await keychain.remove(key: Self.activeConnectionKey)
             }
         } catch {
             print("Failed to save active connection: \(error)")
