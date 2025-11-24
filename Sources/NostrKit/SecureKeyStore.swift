@@ -1,6 +1,7 @@
 import Foundation
 import CoreNostr
 import Security
+import CommonCrypto
 
 /// A secure storage system for NOSTR keys using the iOS Keychain.
 ///

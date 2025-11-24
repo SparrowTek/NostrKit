@@ -343,6 +343,55 @@ struct NostrKitUnitTests {
         #expect(retrievedEvent1 == nil)
     }
     
+    // MARK: - Crypto Tests
+    
+    @Test("NostrCrypto AES-256-CBC round trip succeeds")
+    func testAESCBCEncryptDecrypt() throws {
+        let plaintext = Data("Sample secret message".utf8)
+        let key = Data(repeating: 0x11, count: 32)
+        let iv = Data(repeating: 0x22, count: 16)
+        
+        let ciphertext = try NostrCrypto.aesEncrypt(
+            plaintext: plaintext,
+            key: key,
+            iv: iv
+        )
+        let decrypted = try NostrCrypto.aesDecrypt(
+            ciphertext: ciphertext,
+            key: key,
+            iv: iv
+        )
+        
+        #expect(decrypted == plaintext)
+        #expect(ciphertext != plaintext)
+    }
+    
+    @Test("NostrCrypto AES-256-CBC validates key and IV sizes")
+    func testAESCBCInputValidation() async throws {
+        let plaintext = Data("Test payload".utf8)
+        let shortKey = Data(repeating: 0x00, count: 16)
+        let iv = Data(repeating: 0x01, count: 16)
+        
+        await #expect(throws: NostrError.self) {
+            _ = try NostrCrypto.aesEncrypt(
+                plaintext: plaintext,
+                key: shortKey,
+                iv: iv
+            )
+        }
+        
+        let key = Data(repeating: 0x00, count: 32)
+        let shortIv = Data(repeating: 0x02, count: 8)
+        
+        await #expect(throws: NostrError.self) {
+            _ = try NostrCrypto.aesEncrypt(
+                plaintext: plaintext,
+                key: key,
+                iv: shortIv
+            )
+        }
+    }
+    
     // MARK: - SecureKeyStore Tests
     
     @Test("SecureKeyStore stores and retrieves keys")

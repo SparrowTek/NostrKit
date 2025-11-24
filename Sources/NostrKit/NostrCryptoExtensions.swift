@@ -1,7 +1,8 @@
 import Foundation
 import CoreNostr
 import CryptoKit
-import CryptoSwift
+import Security
+import CommonCrypto
 
 // MARK: - Data Extensions for NostrKit
 
@@ -57,9 +58,13 @@ public extension NostrCrypto {
     /// - Returns: Random bytes as Data
     /// - Throws: ``NostrError/cryptographyError(_:)`` if random generation fails
     static func randomBytes(count: Int) throws -> Data {
+        guard count > 0 else { return Data() }
+        
         var bytes = Data(count: count)
         let result = bytes.withUnsafeMutableBytes { buffer in
-            SecRandomCopyBytes(kSecRandomDefault, count, buffer.baseAddress!)
+            guard let baseAddress = buffer.baseAddress else { return errSecParam }
+            
+            return SecRandomCopyBytes(kSecRandomDefault, count, baseAddress)
         }
         
         guard result == errSecSuccess else {
@@ -99,20 +104,16 @@ public extension NostrCrypto {
     /// - Returns: Encrypted data
     /// - Throws: ``NostrError/encryptionError(_:)`` if encryption fails
     static func aesEncrypt(plaintext: Data, key: Data, iv: Data) throws -> Data {
-        guard key.count == 32 else {
-            throw NostrError.encryptionError(operation: .encrypt, reason: "Key must be 32 bytes")
-        }
-        guard iv.count == 16 else {
-            throw NostrError.encryptionError(operation: .encrypt, reason: "IV must be 16 bytes")
-        }
+        guard key.count == kCCKeySizeAES256 else { throw NostrError.encryptionError(operation: .encrypt, reason: "Key must be 32 bytes") }
+        guard iv.count == kCCBlockSizeAES128 else { throw NostrError.encryptionError(operation: .encrypt, reason: "IV must be 16 bytes") }
         
-        do {
-            let aes = try AES(key: Array(key), blockMode: CBC(iv: Array(iv)), padding: .pkcs7)
-            let encrypted = try aes.encrypt(Array(plaintext))
-            return Data(encrypted)
-        } catch {
-            throw NostrError.encryptionError(operation: .encrypt, reason: error.localizedDescription)
-        }
+        return try aesCBCOperation(
+            operation: CCOperation(kCCEncrypt),
+            input: plaintext,
+            key: key,
+            iv: iv,
+            errorOperation: .encrypt
+        )
     }
     
     /// Decrypts data using AES-256-CBC.
@@ -124,19 +125,98 @@ public extension NostrCrypto {
     /// - Returns: Decrypted data
     /// - Throws: ``NostrError/encryptionError(_:)`` if decryption fails
     static func aesDecrypt(ciphertext: Data, key: Data, iv: Data) throws -> Data {
-        guard key.count == 32 else {
-            throw NostrError.encryptionError(operation: .decrypt, reason: "Key must be 32 bytes")
-        }
-        guard iv.count == 16 else {
-            throw NostrError.encryptionError(operation: .decrypt, reason: "IV must be 16 bytes")
+        guard key.count == kCCKeySizeAES256 else { throw NostrError.encryptionError(operation: .decrypt, reason: "Key must be 32 bytes") }
+        guard iv.count == kCCBlockSizeAES128 else { throw NostrError.encryptionError(operation: .decrypt, reason: "IV must be 16 bytes") }
+        
+        return try aesCBCOperation(
+            operation: CCOperation(kCCDecrypt),
+            input: ciphertext,
+            key: key,
+            iv: iv,
+            errorOperation: .decrypt
+        )
+    }
+}
+
+// MARK: - Private Helpers
+
+private extension NostrCrypto {
+    static func aesCBCOperation(
+        operation: CCOperation,
+        input: Data,
+        key: Data,
+        iv: Data,
+        errorOperation: NostrError.EncryptionOperation
+    ) throws -> Data {
+        var outputLength: size_t = 0
+        let outputCapacity = input.count + kCCBlockSizeAES128
+        var output = Data(count: outputCapacity)
+        
+        let status: CCCryptorStatus = output.withUnsafeMutableBytes { outputBytes in
+            guard let outputBase = outputBytes.baseAddress else {
+                return CCCryptorStatus(kCCMemoryFailure)
+            }
+            
+            return input.withUnsafeBytes { inputBytes in
+                guard let inputBase = inputBytes.baseAddress else {
+                    return CCCryptorStatus(kCCParamError)
+                }
+                
+                return iv.withUnsafeBytes { ivBytes in
+                    guard let ivBase = ivBytes.baseAddress else {
+                        return CCCryptorStatus(kCCParamError)
+                    }
+                    
+                    return key.withUnsafeBytes { keyBytes in
+                        guard let keyBase = keyBytes.baseAddress else {
+                            return CCCryptorStatus(kCCParamError)
+                        }
+                        
+                        return CCCrypt(
+                            operation,
+                            CCAlgorithm(kCCAlgorithmAES),
+                            CCOptions(kCCOptionPKCS7Padding),
+                            keyBase,
+                            key.count,
+                            ivBase,
+                            inputBase,
+                            input.count,
+                            outputBase,
+                            outputCapacity,
+                            &outputLength
+                        )
+                    }
+                }
+            }
         }
         
-        do {
-            let aes = try AES(key: Array(key), blockMode: CBC(iv: Array(iv)), padding: .pkcs7)
-            let decrypted = try aes.decrypt(Array(ciphertext))
-            return Data(decrypted)
-        } catch {
-            throw NostrError.encryptionError(operation: .decrypt, reason: error.localizedDescription)
+        guard status == kCCSuccess else {
+            let reason = ccStatusDescription(status)
+            throw NostrError.encryptionError(operation: errorOperation, reason: reason)
+        }
+        
+        output.removeSubrange(outputLength..<output.count)
+        return output
+    }
+    
+    static func ccStatusDescription(_ status: CCCryptorStatus) -> String {
+        switch status {
+        case CCCryptorStatus(kCCSuccess):
+            return "Operation completed successfully"
+        case CCCryptorStatus(kCCParamError):
+            return "Parameter error"
+        case CCCryptorStatus(kCCBufferTooSmall):
+            return "Output buffer too small"
+        case CCCryptorStatus(kCCMemoryFailure):
+            return "Memory failure"
+        case CCCryptorStatus(kCCAlignmentError):
+            return "Input alignment error"
+        case CCCryptorStatus(kCCDecodeError):
+            return "Input decode error"
+        case CCCryptorStatus(kCCUnimplemented):
+            return "Operation not implemented"
+        default:
+            return "Unknown error (status \(status))"
         }
     }
 }

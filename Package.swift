@@ -1,15 +1,15 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 
 import PackageDescription
 
 let package = Package(
     name: "NostrKit",
     platforms: [
-        .macOS(.v15),
-        .iOS(.v17),
-        .tvOS(.v17),
-        .watchOS(.v10),
-        .macCatalyst(.v17)
+        .macOS(.v26),
+        .iOS(.v26),
+        .tvOS(.v26),
+        .watchOS(.v26),
+        .macCatalyst(.v26)
     ],
     products: [
         .library(
@@ -17,15 +17,14 @@ let package = Package(
             targets: ["NostrKit"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/SparrowTek/CoreNostr.git", branch: "main"),
-        .package(url: "https://github.com/krzyzanowskim/CryptoSwift.git", from: "1.8.3")
+        .package(path: "//CoreNostr")
+//        .package(url: "https://github.com/SparrowTek/CoreNostr.git", branch: "main"),
     ],
     targets: [
         .target(
             name: "NostrKit",
             dependencies: [
                 "CoreNostr",
-                "CryptoSwift"
             ]),
         .testTarget(
             name: "NostrKitTests",
