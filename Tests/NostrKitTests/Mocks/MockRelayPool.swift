@@ -76,12 +76,21 @@ actor MockRelayPool: RelayPoolProtocol, WalletRelayPool {
         }
     }
     
-    nonisolated func connectAll() async {
+    func connectAll() async {
         // Mocks eagerly connect in addRelay
     }
     
-    func publish(_ event: NostrEvent) async -> [RelayPool.PublishResult] {
-        var results: [RelayPool.PublishResult] = []
+    func disconnectAll() async {
+        for relay in mockRelays.values {
+            await relay.disconnect()
+        }
+        mockRelays.removeAll()
+        activeSubscriptions.removeAll()
+        publishedEvents.removeAll()
+    }
+    
+    func publish(_ event: NostrEvent) async -> [NostrKit.RelayPool.PublishResult] {
+        var results: [NostrKit.RelayPool.PublishResult] = []
         publishedEvents.append(event)
         
         // Simulate publish delay
@@ -90,7 +99,7 @@ actor MockRelayPool: RelayPoolProtocol, WalletRelayPool {
         if shouldFailPublish {
             for url in mockRelays.keys {
                 results.append(
-                    RelayPool.PublishResult(
+                    NostrKit.RelayPool.PublishResult(
                         relay: url.absoluteString,
                         success: false,
                         message: nil,
@@ -117,7 +126,7 @@ actor MockRelayPool: RelayPoolProtocol, WalletRelayPool {
                     }
                     
                     results.append(
-                        RelayPool.PublishResult(
+                        NostrKit.RelayPool.PublishResult(
                             relay: url.absoluteString,
                             success: true,
                             message: nil,
@@ -126,7 +135,7 @@ actor MockRelayPool: RelayPoolProtocol, WalletRelayPool {
                     )
                 } catch {
                     results.append(
-                        RelayPool.PublishResult(
+                        NostrKit.RelayPool.PublishResult(
                             relay: url.absoluteString,
                             success: false,
                             message: nil,

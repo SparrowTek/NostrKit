@@ -14,7 +14,7 @@ import OSLog
 
 extension RelayPool: WalletRelayPool {
     func addRelay(url: String) async throws {
-        _ = try addRelay(url: url)
+        _ = try self.addRelay(url: url, metadata: nil)
     }
     
     func walletSubscribe(filters: [Filter], id: String?) async throws -> WalletSubscription {
@@ -32,10 +32,11 @@ protocol WalletRelayPool: Actor {
     func publish(_ event: NostrEvent) async -> [RelayPool.PublishResult]
     func walletSubscribe(filters: [Filter], id: String?) async throws -> WalletSubscription
     func closeSubscription(id: String) async
+    func disconnectAll() async
 }
 
 /// Minimal subscription wrapper to decouple WalletConnectManager from the underlying relay pool implementation.
-public struct WalletSubscription {
+public struct WalletSubscription: Sendable {
     public let id: String
     public let events: AsyncStream<NostrEvent>
 }
@@ -279,9 +280,20 @@ public class WalletConnectManager: ObservableObject {
     /// on initialization. No manual setup is required.
     ///
     /// - Note: The manager must be used on the main actor for SwiftUI compatibility.
-    public init(
-        relayPool: any WalletRelayPool = RelayPool(),
-        keychain: KeychainWrapper = KeychainWrapper(service: Self.keychainService),
+    public init(maxRequestsPerMinute: Int = 30) {
+        self.keychain = KeychainWrapper(service: Self.keychainService)
+        self.relayPool = RelayPool()
+        self.rateLimiter = NWCRateLimiter(maxRequestsPerMinute: maxRequestsPerMinute)
+        
+        Task {
+            await loadConnections()
+        }
+    }
+    
+    // Internal initializer for testing/custom injection
+    init(
+        relayPool: any WalletRelayPool,
+        keychain: KeychainWrapper,
         seedConnections: [WalletConnection]? = nil,
         activeConnectionId: String? = nil,
         maxRequestsPerMinute: Int = 30
@@ -296,10 +308,6 @@ public class WalletConnectManager: ObservableObject {
                 self.activeConnection = seedConnections.first(where: { $0.id == activeId })
             } else {
                 self.activeConnection = seedConnections.first
-            }
-        } else {
-            Task {
-                await loadConnections()
             }
         }
     }
@@ -922,10 +930,10 @@ public class WalletConnectManager: ObservableObject {
         )
         
         // Subscribe and collect info event
-        let subscription = try await relayPool.walletSubscribe(
-            filters: [filter],
-            id: "nwc-info-\(UUID().uuidString)"
-        )
+            let subscription = try await relayPool.walletSubscribe(
+                filters: [filter],
+                id: "nwc-info-\(UUID().uuidString)"
+            )
         
         var infoEvent: NostrEvent?
         
@@ -934,7 +942,7 @@ public class WalletConnectManager: ObservableObject {
             try await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
         }
         
-        for await event in await subscription.events {
+        for await event in subscription.events {
             infoEvent = event
             break
         }
