@@ -17,8 +17,7 @@ let package = Package(
             targets: ["NostrKit"]),
     ],
     dependencies: [
-        .package(path: "../CoreNostr")
-//        .package(url: "https://github.com/SparrowTek/CoreNostr.git", branch: "main"),
+        .package(url: "https://github.com/SparrowTek/CoreNostr.git", branch: "main"),
     ],
     targets: [
         .target(
