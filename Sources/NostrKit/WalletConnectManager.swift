@@ -281,12 +281,15 @@ public class WalletConnectManager: ObservableObject {
     private let keychain: any WalletStorage
     private let relayPool: any WalletRelayPool
     private var subscriptions: [String: String] = [:] // requestId -> subscriptionId
-    private var pendingRequests: [String: CheckedContinuation<NostrEvent, Error>] = [:]
     private var notificationSubscription: String?
+    private var notificationTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
     private var processedResponses: Set<String> = []
     private var processedNotifications: Set<String> = []
     private var rateLimiter: NWCRateLimiter
+    
+    /// Maximum age for processed response/notification IDs before cleanup (1 hour)
+    private static let processedIdMaxAge: TimeInterval = 3600
     
     // MARK: - Constants
     
@@ -440,6 +443,10 @@ public class WalletConnectManager: ObservableObject {
     public func disconnect() async {
         connectionState = .disconnected
         
+        // Cancel notification listening task
+        notificationTask?.cancel()
+        notificationTask = nil
+        
         // Cancel all subscriptions
         for subscriptionId in subscriptions.values {
             await relayPool.closeSubscription(id: subscriptionId)
@@ -461,6 +468,10 @@ public class WalletConnectManager: ObservableObject {
         // Clear cached data
         balance = nil
         recentTransactions = []
+        
+        // Clear processed ID caches to prevent memory leaks
+        processedResponses.removeAll()
+        processedNotifications.removeAll()
     }
     
     /// Permanently removes a wallet connection from storage.
@@ -659,18 +670,11 @@ public class WalletConnectManager: ObservableObject {
         
         guard let result = responseData.result,
               let preimage = result["preimage"]?.value as? String else {
-            throw NWCError(code: .other, message: "Invalid response format")
+            throw NWCError(code: .other, message: "Invalid response format: missing preimage")
         }
         
-        let feesValue = result["fees_paid"]?.value
-        let feesPaid: Int64?
-        if let int64 = feesValue as? Int64 {
-            feesPaid = int64
-        } else if let intVal = feesValue as? Int {
-            feesPaid = Int64(intVal)
-        } else {
-            feesPaid = nil
-        }
+        // Use helper for robust numeric parsing (JSON numbers can decode as various types)
+        let feesPaid = extractInt64(from: result["fees_paid"])
         let paymentHash = result["payment_hash"]?.value as? String
         
         // Update last used timestamp
@@ -743,8 +747,8 @@ public class WalletConnectManager: ObservableObject {
         }
         
         guard let result = responseData.result,
-              let balance = result["balance"]?.value as? Int64 else {
-            throw NWCError(code: .other, message: "Invalid response format")
+              let balance = extractInt64(from: result["balance"]) else {
+            throw NWCError(code: .other, message: "Invalid response format: missing or invalid balance")
         }
         
         self.balance = balance
@@ -930,6 +934,28 @@ public class WalletConnectManager: ObservableObject {
     
     // MARK: - Private Methods
     
+    /// Extracts an Int64 value from an AnyCodable, handling various numeric types.
+    ///
+    /// JSON numbers can be decoded as Int, Int64, Double, etc. depending on their size
+    /// and the decoder. This helper handles all common cases.
+    private func extractInt64(from anyCodable: AnyCodable?) -> Int64? {
+        guard let value = anyCodable?.value else { return nil }
+        
+        if let int64 = value as? Int64 {
+            return int64
+        } else if let int = value as? Int {
+            return Int64(int)
+        } else if let double = value as? Double {
+            return Int64(double)
+        } else if let uint64 = value as? UInt64, uint64 <= UInt64(Int64.max) {
+            return Int64(uint64)
+        } else if let nsNumber = value as? NSNumber {
+            return nsNumber.int64Value
+        }
+        
+        return nil
+    }
+    
     private func enforceRateLimit() throws {
         guard rateLimiter.consume() else {
             throw NWCError(code: .rateLimited, message: "Too many wallet requests. Please wait.")
@@ -987,6 +1013,9 @@ public class WalletConnectManager: ObservableObject {
         return NWCInfo(content: event.content, tags: event.tags)
     }
     
+    /// Timeout duration for NWC requests (30 seconds)
+    private static let requestTimeoutNanoseconds: UInt64 = 30_000_000_000
+    
     private func sendRequestAndWaitForResponse(_ request: NostrEvent) async throws -> NostrEvent {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
@@ -1013,46 +1042,91 @@ public class WalletConnectManager: ObservableObject {
         // Check if at least one relay accepted the event
         guard publishResults.contains(where: { $0.success }) else {
             await relayPool.closeSubscription(id: subscription.id)
+            subscriptions.removeValue(forKey: request.id)
             throw NWCError(code: .other, message: "Failed to publish request to any relay")
         }
 
-        // Wait for response with timeout
-        return try await withCheckedThrowingContinuation { continuation in
-            Task {
-                // Set up timeout
-                Task {
-                    try await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
-                    if pendingRequests[request.id] != nil {
-                        pendingRequests.removeValue(forKey: request.id)
-                        continuation.resume(throwing: RelayError.timeout)
+        // Capture values needed by the task to avoid actor isolation issues
+        let walletPubkey = connection.uri.walletPubkey
+        let requestId = request.id
+        
+        // Wait for response with timeout using TaskGroup for proper cancellation
+        // This ensures that when one task completes (either timeout or response),
+        // the other is automatically cancelled, preventing race conditions.
+        do {
+            let result = try await withThrowingTaskGroup(of: NostrEvent?.self) { group in
+                // Task 1: Listen for response events
+                group.addTask {
+                    for await event in subscription.events {
+                        // Verify event is from the wallet
+                        guard event.pubkey == walletPubkey else { continue }
+                        // Verify correct event kind
+                        guard event.kind == EventKind.nwcResponse.rawValue else { continue }
+                        // Verify this is a response to our request (via 'e' tag)
+                        guard event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == requestId }) else {
+                            continue
+                        }
+                        
+                        return event
+                    }
+                    // Stream ended without finding a matching event
+                    return nil
+                }
+                
+                // Task 2: Timeout after 30 seconds
+                group.addTask {
+                    try await Task.sleep(nanoseconds: Self.requestTimeoutNanoseconds)
+                    return nil // Signal timeout by returning nil
+                }
+                
+                // Wait for the first task to complete
+                // When one completes, cancel the other
+                if let result = try await group.next() {
+                    // Cancel remaining tasks (timeout or listener)
+                    group.cancelAll()
+                    
+                    if let event = result {
+                        return event
+                    } else {
+                        // nil means either timeout or stream ended without match
+                        throw RelayError.timeout
                     }
                 }
                 
-                // Store continuation
-                pendingRequests[request.id] = continuation
-                
-                // Listen for response
-                for await event in subscription.events {
-                    guard !processedResponses.contains(event.id) else { continue }
-                    guard event.pubkey == connection.uri.walletPubkey else { continue }
-                    guard event.kind == EventKind.nwcResponse.rawValue else { continue }
-                    
-                    guard event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == request.id }) else {
-                        continue
-                    }
-                    
-                    processedResponses.insert(event.id)
-                    pendingRequests.removeValue(forKey: request.id)
-                    await relayPool.closeSubscription(id: subscription.id)
-                    subscriptions.removeValue(forKey: request.id)
-                    continuation.resume(returning: event)
-                    break
-                }
+                // Should not reach here, but handle gracefully
+                throw RelayError.timeout
             }
+            
+            // Check if we already processed this response (prevents duplicate handling)
+            guard !processedResponses.contains(result.id) else {
+                throw NWCError(code: .other, message: "Duplicate response received")
+            }
+            
+            // Mark response as processed and clean up
+            processedResponses.insert(result.id)
+            await relayPool.closeSubscription(id: subscription.id)
+            subscriptions.removeValue(forKey: request.id)
+            
+            return result
+            
+        } catch is CancellationError {
+            // Clean up on cancellation
+            await relayPool.closeSubscription(id: subscription.id)
+            subscriptions.removeValue(forKey: request.id)
+            throw NWCError(code: .other, message: "Request was cancelled")
+        } catch {
+            // Clean up on any error
+            await relayPool.closeSubscription(id: subscription.id)
+            subscriptions.removeValue(forKey: request.id)
+            throw error
         }
     }
     
     private func subscribeToNotifications() async {
+        // Cancel any existing notification task first
+        notificationTask?.cancel()
+        notificationTask = nil
+        
         guard let connection = activeConnection else { return }
         
         // Check if wallet supports notifications
@@ -1075,9 +1149,12 @@ public class WalletConnectManager: ObservableObject {
             let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
             notificationSubscription = subscription.id
             
-            Task {
+            // Store task reference so we can cancel it on disconnect
+            notificationTask = Task { [weak self] in
                 for await event in subscription.events {
-                    await handleNotification(event)
+                    // Check for cancellation
+                    guard !Task.isCancelled else { break }
+                    await self?.handleNotification(event)
                 }
             }
         } catch {
@@ -1142,7 +1219,7 @@ public class WalletConnectManager: ObservableObject {
             let data = try JSONEncoder().encode(connections)
             try await keychain.store(data, forKey: Self.connectionsKey)
         } catch {
-            print("Failed to save connections: \(error)")
+            nwcLogger.error("Failed to save connections", error: error)
         }
     }
     
@@ -1155,7 +1232,7 @@ public class WalletConnectManager: ObservableObject {
                 try await keychain.remove(key: Self.activeConnectionKey)
             }
         } catch {
-            print("Failed to save active connection: \(error)")
+            nwcLogger.error("Failed to save active connection", error: error)
         }
     }
 }
@@ -1199,11 +1276,26 @@ extension WalletConnectManager {
     
     /// The preferred encryption scheme for the active wallet connection.
     ///
-    /// Returns NIP-44 if supported, otherwise falls back to NIP-04 for legacy compatibility.
+    /// Returns NIP-44 if supported (the secure default), otherwise falls back to NIP-04
+    /// for legacy wallet compatibility.
+    ///
+    /// - Note: NIP-44 is the recommended encryption scheme. NIP-04 is deprecated and
+    ///   should only be used for backwards compatibility with older wallets.
     public var preferredEncryption: NWCEncryption {
         guard let capabilities = activeConnection?.capabilities else {
-            return .nip04 // Default to legacy
+            // Default to NIP-44 (secure) when capabilities are unknown
+            // The wallet will respond with an error if it doesn't support NIP-44
+            return .nip44
         }
-        return capabilities.encryptionSchemes.contains(.nip44) ? .nip44 : .nip04
+        
+        // Prefer NIP-44 if supported, fall back to NIP-04 only if explicitly needed
+        if capabilities.encryptionSchemes.contains(.nip44) {
+            return .nip44
+        } else if capabilities.encryptionSchemes.contains(.nip04) {
+            return .nip04
+        } else {
+            // No encryption schemes specified, assume NIP-44 support
+            return .nip44
+        }
     }
 }
