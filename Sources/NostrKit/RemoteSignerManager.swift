@@ -71,7 +71,8 @@ import OSLog
 /// let pubkey = try await signerManager.getPublicKey()
 /// ```
 @MainActor
-public class RemoteSignerManager: ObservableObject {
+@Observable
+public class RemoteSignerManager {
     
     // MARK: - Types
     
@@ -156,19 +157,19 @@ public class RemoteSignerManager: ObservableObject {
     // MARK: - Published Properties
     
     /// The currently active signer connection.
-    @Published public private(set) var activeConnection: SignerConnection?
+    public private(set) var activeConnection: SignerConnection?
     
     /// The current connection state.
-    @Published public private(set) var connectionState: ConnectionState = .disconnected
+    public private(set) var connectionState: ConnectionState = .disconnected
     
     /// The user's public key from the remote signer.
-    @Published public private(set) var userPublicKey: String?
+    public private(set) var userPublicKey: String?
     
     /// Indicates whether an operation is currently in progress.
-    @Published public private(set) var isLoading = false
+    public private(set) var isLoading = false
     
     /// The most recent error that occurred.
-    @Published public private(set) var lastError: Error?
+    public private(set) var lastError: Error?
     
     // MARK: - Private Properties
     

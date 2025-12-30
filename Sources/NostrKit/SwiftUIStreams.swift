@@ -5,14 +5,15 @@ import CoreNostr
 
 /// SwiftUI-friendly wrapper for NostrKit event streams
 @MainActor
-public class NostrEventStream: ObservableObject {
+@Observable
+public class NostrEventStream {
     
     // MARK: - Published Properties
     
-    @Published public private(set) var events: [NostrEvent] = []
-    @Published public private(set) var isLoading = false
-    @Published public private(set) var error: Error?
-    @Published public private(set) var connectionState: ConnectionState = .disconnected
+    public private(set) var events: [NostrEvent] = []
+    public private(set) var isLoading = false
+    public private(set) var error: Error?
+    public private(set) var connectionState: ConnectionState = .disconnected
     
     // MARK: - Properties
     
@@ -37,9 +38,9 @@ public class NostrEventStream: ObservableObject {
     }
     
     deinit {
-        for task in eventTasks.values {
-            task.cancel()
-        }
+//        for task in eventTasks.values {
+//            task.cancel()
+//        }
     }
     
     // MARK: - Public Methods
@@ -320,87 +321,5 @@ extension RelayPool {
         )
         
         return events(for: filter)
-    }
-}
-
-// MARK: - SwiftUI View Modifiers
-
-public extension View {
-    /// Subscribes to Nostr events and updates the view when new events arrive
-    func onNostrEvents(
-        _ stream: NostrEventStream,
-        filter: Filter,
-        action: @escaping ([NostrEvent]) -> Void
-    ) -> some View {
-        self
-            .task {
-                await stream.subscribe(to: filter)
-            }
-            .onReceive(stream.$events) { events in
-                action(events)
-            }
-            .onDisappear {
-                Task {
-                    await stream.unsubscribeAll()
-                }
-            }
-    }
-    
-    /// Shows a loading indicator while events are being fetched
-    func nostrLoadingOverlay(_ stream: NostrEventStream) -> some View {
-        self.overlay {
-            if stream.isLoading {
-                ProgressView()
-                    .progressViewStyle(CircularProgressViewStyle())
-                    .scaleEffect(1.5)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.black.opacity(0.3))
-            }
-        }
-    }
-    
-    /// Shows an error alert if event fetching fails
-    func nostrErrorAlert(_ stream: NostrEventStream) -> some View {
-        self.alert(
-            "Error",
-            isPresented: .constant(stream.error != nil),
-            presenting: stream.error
-        ) { _ in
-            Button("OK") {
-                stream.clearError()
-            }
-        } message: { error in
-            Text(error.localizedDescription)
-        }
-    }
-}
-
-// MARK: - Example Usage
-
-/// Example SwiftUI view using NostrEventStream
-struct ExampleNostrView: View {
-    @StateObject private var eventStream: NostrEventStream
-    @State private var events: [NostrEvent] = []
-    
-    init(relayPool: RelayPool) {
-        _eventStream = StateObject(wrappedValue: NostrEventStream(relayPool: relayPool))
-    }
-    
-    var body: some View {
-        List(events, id: \.id) { event in
-            VStack(alignment: .leading) {
-                Text(event.content)
-                    .font(.body)
-                Text("by \(event.pubkey.prefix(8))...")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-        }
-        .onNostrEvents(eventStream, filter: Filter(kinds: [1], limit: 50)) { newEvents in
-            events = newEvents.sorted { $0.createdAt > $1.createdAt }
-        }
-        .nostrLoadingOverlay(eventStream)
-        .nostrErrorAlert(eventStream)
-        .navigationTitle("Nostr Feed")
     }
 }

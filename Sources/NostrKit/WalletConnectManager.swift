@@ -163,7 +163,8 @@ private struct NWCRateLimiter {
 /// - ``supportsNotifications``
 /// - ``preferredEncryption``
 @MainActor
-public class WalletConnectManager: ObservableObject {
+@Observable
+public class WalletConnectManager {
     
     // MARK: - Types
     
@@ -243,38 +244,38 @@ public class WalletConnectManager: ObservableObject {
     /// All wallet connections stored in the Keychain.
     ///
     /// This array persists across app launches and is automatically loaded on initialization.
-    @Published public private(set) var connections: [WalletConnection] = []
+    public private(set) var connections: [WalletConnection] = []
     
     /// The currently active wallet connection used for payment operations.
     ///
     /// Set this to `nil` to disconnect, or use ``switchConnection(to:)`` to change wallets.
-    @Published public var activeConnection: WalletConnection?
+    public var activeConnection: WalletConnection?
     
     /// The current connection state of the active wallet.
     ///
     /// Observe this property to update your UI based on connection status.
-    @Published public private(set) var connectionState: ConnectionState = .disconnected
+    public private(set) var connectionState: ConnectionState = .disconnected
     
     /// The last known wallet balance in millisatoshis.
     ///
     /// This value is updated when calling ``getBalance()`` or when receiving payment notifications.
     /// - Note: 1000 millisats = 1 satoshi
-    @Published public private(set) var balance: Int64?
+    public private(set) var balance: Int64?
     
     /// Recent transactions fetched from the wallet.
     ///
     /// Updated by calling ``listTransactions(from:until:limit:)`` or via notifications.
-    @Published public private(set) var recentTransactions: [NWCTransaction] = []
+    public private(set) var recentTransactions: [NWCTransaction] = []
     
     /// Indicates whether an operation is currently in progress.
     ///
     /// Use this to show loading indicators in your UI.
-    @Published public private(set) var isLoading = false
+    public private(set) var isLoading = false
     
     /// The most recent error that occurred, if any.
     ///
     /// This is set when operations fail and can be used for error reporting.
-    @Published public private(set) var lastError: Error?
+    public private(set) var lastError: Error?
     
     // MARK: - Private Properties
     
