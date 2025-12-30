@@ -208,7 +208,7 @@ public class WalletConnectManager: ObservableObject {
     /// The result of a successful Lightning payment.
     ///
     /// Contains the payment proof (preimage) and optional fee information.
-    public struct PaymentResult {
+    public struct PaymentResult: Sendable {
         /// The payment preimage serving as proof of payment.
         ///
         /// This 32-byte value is the cryptographic proof that the payment was completed.
@@ -288,8 +288,22 @@ public class WalletConnectManager: ObservableObject {
     private var processedNotifications: Set<String> = []
     private var rateLimiter: NWCRateLimiter
     
+    // Reconnection state
+    private var reconnectionTask: Task<Void, Never>?
+    private var reconnectionAttempts: Int = 0
+    private var isAutoReconnectEnabled: Bool = true
+    
     /// Maximum age for processed response/notification IDs before cleanup (1 hour)
     private static let processedIdMaxAge: TimeInterval = 3600
+    
+    /// Maximum reconnection attempts before giving up
+    private static let maxReconnectionAttempts: Int = 10
+    
+    /// Base delay for exponential backoff (1 second)
+    private static let baseReconnectionDelay: TimeInterval = 1.0
+    
+    /// Maximum delay between reconnection attempts (5 minutes)
+    private static let maxReconnectionDelay: TimeInterval = 300.0
     
     // MARK: - Constants
     
@@ -932,6 +946,789 @@ public class WalletConnectManager: ObservableObject {
         return transactions
     }
     
+    // MARK: - Keysend Operations
+    
+    /// A TLV record for keysend payments.
+    ///
+    /// TLV (Type-Length-Value) records allow attaching custom data to Lightning payments.
+    public struct TLVRecord: Sendable {
+        /// The TLV type identifier.
+        public let type: UInt64
+        
+        /// The hex-encoded value.
+        public let value: String
+        
+        /// Creates a new TLV record.
+        ///
+        /// - Parameters:
+        ///   - type: The TLV type identifier
+        ///   - value: The hex-encoded value
+        public init(type: UInt64, value: String) {
+            self.type = type
+            self.value = value
+        }
+    }
+    
+    /// Sends a keysend payment directly to a Lightning node.
+    ///
+    /// Keysend payments don't require an invoice - they are sent directly to a node's
+    /// public key. This is useful for spontaneous payments or tips.
+    ///
+    /// - Parameters:
+    ///   - amount: The amount to send in millisatoshis
+    ///   - pubkey: The recipient node's public key (33-byte compressed, hex-encoded)
+    ///   - preimage: Optional custom preimage (32-byte hex). If not provided, the wallet generates one.
+    ///   - tlvRecords: Optional TLV records to attach to the payment
+    ///
+    /// - Returns: A ``PaymentResult`` containing the payment preimage and optional fee information.
+    ///
+    /// - Throws:
+    ///   - ``NWCError/insufficientBalance``: The wallet doesn't have enough funds
+    ///   - ``NWCError/paymentFailed``: The payment could not be completed
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    ///   - ``NWCError/notImplemented``: Wallet doesn't support keysend
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// do {
+    ///     // Send 1000 sats to a node
+    ///     let result = try await walletManager.payKeysend(
+    ///         amount: 1_000_000,  // 1000 sats in millisats
+    ///         pubkey: "03...node_pubkey..."
+    ///     )
+    ///     print("Keysend successful! Preimage: \(result.preimage)")
+    /// } catch {
+    ///     print("Keysend failed: \(error)")
+    /// }
+    /// ```
+    public func payKeysend(
+        amount: Int64,
+        pubkey: String,
+        preimage: String? = nil,
+        tlvRecords: [TLVRecord]? = nil
+    ) async throws -> PaymentResult {
+        guard let connection = activeConnection else {
+            throw NWCError(code: .unauthorized, message: "No active wallet connection")
+        }
+        guard supportsMethod(.payKeysend) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support pay_keysend")
+        }
+        try enforceRateLimit()
+        
+        isLoading = true
+        defer { isLoading = false }
+        
+        var params: [String: AnyCodable] = [
+            "amount": AnyCodable(amount),
+            "pubkey": AnyCodable(pubkey)
+        ]
+        
+        if let preimage = preimage {
+            params["preimage"] = AnyCodable(preimage)
+        }
+        
+        if let tlvRecords = tlvRecords, !tlvRecords.isEmpty {
+            let tlvArray = tlvRecords.map { record in
+                ["type": AnyCodable(record.type), "value": AnyCodable(record.value)]
+            }
+            params["tlv_records"] = AnyCodable(tlvArray)
+        }
+        
+        let requestEvent = try NostrEvent.nwcRequest(
+            method: .payKeysend,
+            params: params,
+            walletPubkey: connection.uri.walletPubkey,
+            clientSecret: connection.uri.secret,
+            encryption: try resolveEncryption()
+        )
+        
+        let response = try await sendRequestAndWaitForResponse(requestEvent)
+        
+        let decryptedContent = try response.decryptNWCContent(
+            with: connection.uri.secret,
+            peerPubkey: connection.uri.walletPubkey
+        )
+        
+        let responseData = try JSONDecoder().decode(NWCResponse.self, from: Data(decryptedContent.utf8))
+        
+        if let error = responseData.error {
+            throw error
+        }
+        
+        guard let result = responseData.result,
+              let resultPreimage = result["preimage"]?.value as? String else {
+            throw NWCError(code: .other, message: "Invalid response format: missing preimage")
+        }
+        
+        let feesPaid = extractInt64(from: result["fees_paid"])
+        
+        // Update last used timestamp
+        if let idx = connections.firstIndex(where: { $0.id == connection.id }) {
+            connections[idx].lastUsedAt = Date()
+            await saveConnections()
+        }
+        
+        return PaymentResult(
+            preimage: resultPreimage,
+            feesPaid: feesPaid,
+            paymentHash: nil
+        )
+    }
+    
+    // MARK: - Invoice Lookup
+    
+    /// The result of looking up an invoice.
+    public struct InvoiceLookupResult: Sendable {
+        /// The transaction type (incoming for invoices, outgoing for payments).
+        public let type: NWCTransactionType
+        
+        /// The current state of the invoice/payment.
+        public let state: NWCTransactionState?
+        
+        /// The BOLT11 invoice string.
+        public let invoice: String?
+        
+        /// Invoice description.
+        public let description: String?
+        
+        /// Invoice description hash (for large descriptions).
+        public let descriptionHash: String?
+        
+        /// Payment preimage (available if settled).
+        public let preimage: String?
+        
+        /// Payment hash identifying this invoice/payment.
+        public let paymentHash: String
+        
+        /// Amount in millisatoshis.
+        public let amount: Int64
+        
+        /// Fees paid in millisatoshis (for outgoing payments).
+        public let feesPaid: Int64?
+        
+        /// When the invoice was created.
+        public let createdAt: Date
+        
+        /// When the invoice expires.
+        public let expiresAt: Date?
+        
+        /// When the invoice was settled.
+        public let settledAt: Date?
+    }
+    
+    /// Looks up an invoice or payment by its payment hash.
+    ///
+    /// Use this to check the status of an invoice you created or a payment you made.
+    ///
+    /// - Parameter paymentHash: The payment hash (hex-encoded)
+    ///
+    /// - Returns: An ``InvoiceLookupResult`` with the invoice details
+    ///
+    /// - Throws:
+    ///   - ``NWCError/notFound``: No invoice found with this payment hash
+    ///   - ``NWCError/notImplemented``: Wallet doesn't support invoice lookup
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// do {
+    ///     let result = try await walletManager.lookupInvoice(
+    ///         paymentHash: "abc123..."
+    ///     )
+    ///     
+    ///     switch result.state {
+    ///     case .settled:
+    ///         print("Invoice was paid!")
+    ///     case .pending:
+    ///         print("Still waiting for payment...")
+    ///     case .expired:
+    ///         print("Invoice expired")
+    ///     default:
+    ///         break
+    ///     }
+    /// } catch let error as NWCError where error.code == .notFound {
+    ///     print("Invoice not found")
+    /// }
+    /// ```
+    public func lookupInvoice(paymentHash: String) async throws -> InvoiceLookupResult {
+        try await lookupInvoiceInternal(paymentHash: paymentHash, invoice: nil)
+    }
+    
+    /// Looks up an invoice by its BOLT11 string.
+    ///
+    /// - Parameter invoice: The BOLT11 invoice string
+    ///
+    /// - Returns: An ``InvoiceLookupResult`` with the invoice details
+    ///
+    /// - Throws:
+    ///   - ``NWCError/notFound``: Invoice not found
+    ///   - ``NWCError/notImplemented``: Wallet doesn't support invoice lookup
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    public func lookupInvoice(invoice: String) async throws -> InvoiceLookupResult {
+        try await lookupInvoiceInternal(paymentHash: nil, invoice: invoice)
+    }
+    
+    private func lookupInvoiceInternal(paymentHash: String?, invoice: String?) async throws -> InvoiceLookupResult {
+        guard let connection = activeConnection else {
+            throw NWCError(code: .unauthorized, message: "No active wallet connection")
+        }
+        guard supportsMethod(.lookupInvoice) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support lookup_invoice")
+        }
+        try enforceRateLimit()
+        
+        isLoading = true
+        defer { isLoading = false }
+        
+        var params: [String: AnyCodable] = [:]
+        if let paymentHash = paymentHash {
+            params["payment_hash"] = AnyCodable(paymentHash)
+        }
+        if let invoice = invoice {
+            params["invoice"] = AnyCodable(invoice)
+        }
+        
+        let requestEvent = try NostrEvent.nwcRequest(
+            method: .lookupInvoice,
+            params: params,
+            walletPubkey: connection.uri.walletPubkey,
+            clientSecret: connection.uri.secret,
+            encryption: try resolveEncryption()
+        )
+        
+        let response = try await sendRequestAndWaitForResponse(requestEvent)
+        
+        let decryptedContent = try response.decryptNWCContent(
+            with: connection.uri.secret,
+            peerPubkey: connection.uri.walletPubkey
+        )
+        
+        let responseData = try JSONDecoder().decode(NWCResponse.self, from: Data(decryptedContent.utf8))
+        
+        if let error = responseData.error {
+            throw error
+        }
+        
+        guard let result = responseData.result else {
+            throw NWCError(code: .other, message: "Invalid response format: missing result")
+        }
+        
+        // Parse the result
+        guard let typeString = result["type"]?.value as? String,
+              let type = NWCTransactionType(rawValue: typeString),
+              let resultPaymentHash = result["payment_hash"]?.value as? String,
+              let amount = extractInt64(from: result["amount"]) else {
+            throw NWCError(code: .other, message: "Invalid response format: missing required fields")
+        }
+        
+        let state: NWCTransactionState?
+        if let stateString = result["state"]?.value as? String {
+            state = NWCTransactionState(rawValue: stateString)
+        } else {
+            state = nil
+        }
+        
+        let createdAt: Date
+        if let timestamp = extractInt64(from: result["created_at"]) {
+            createdAt = Date(timeIntervalSince1970: TimeInterval(timestamp))
+        } else {
+            createdAt = Date()
+        }
+        
+        let expiresAt: Date?
+        if let timestamp = extractInt64(from: result["expires_at"]) {
+            expiresAt = Date(timeIntervalSince1970: TimeInterval(timestamp))
+        } else {
+            expiresAt = nil
+        }
+        
+        let settledAt: Date?
+        if let timestamp = extractInt64(from: result["settled_at"]) {
+            settledAt = Date(timeIntervalSince1970: TimeInterval(timestamp))
+        } else {
+            settledAt = nil
+        }
+        
+        return InvoiceLookupResult(
+            type: type,
+            state: state,
+            invoice: result["invoice"]?.value as? String,
+            description: result["description"]?.value as? String,
+            descriptionHash: result["description_hash"]?.value as? String,
+            preimage: result["preimage"]?.value as? String,
+            paymentHash: resultPaymentHash,
+            amount: amount,
+            feesPaid: extractInt64(from: result["fees_paid"]),
+            createdAt: createdAt,
+            expiresAt: expiresAt,
+            settledAt: settledAt
+        )
+    }
+    
+    // MARK: - Wallet Info
+    
+    /// Information about the connected wallet/node.
+    public struct WalletInfo: Sendable {
+        /// Node alias/name.
+        public let alias: String?
+        
+        /// Node color (hex string).
+        public let color: String?
+        
+        /// Node public key.
+        public let pubkey: String?
+        
+        /// Network the node is running on (mainnet, testnet, signet, regtest).
+        public let network: String?
+        
+        /// Current block height.
+        public let blockHeight: Int?
+        
+        /// Current block hash.
+        public let blockHash: String?
+        
+        /// Supported NWC methods for this connection.
+        public let methods: [NWCMethod]
+        
+        /// Supported notification types.
+        public let notifications: [NWCNotificationType]
+    }
+    
+    /// Retrieves information about the connected wallet/node.
+    ///
+    /// This provides details about the Lightning node including its alias, network,
+    /// current block height, and supported capabilities.
+    ///
+    /// - Returns: A ``WalletInfo`` containing node details
+    ///
+    /// - Throws:
+    ///   - ``NWCError/notImplemented``: Wallet doesn't support get_info
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// do {
+    ///     let info = try await walletManager.getInfo()
+    ///     
+    ///     if let alias = info.alias {
+    ///         print("Connected to: \(alias)")
+    ///     }
+    ///     
+    ///     if let network = info.network {
+    ///         print("Network: \(network)")
+    ///     }
+    ///     
+    ///     print("Supported methods: \(info.methods.map { $0.rawValue })")
+    /// } catch {
+    ///     print("Failed to get wallet info: \(error)")
+    /// }
+    /// ```
+    public func getInfo() async throws -> WalletInfo {
+        guard let connection = activeConnection else {
+            throw NWCError(code: .unauthorized, message: "No active wallet connection")
+        }
+        guard supportsMethod(.getInfo) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support get_info")
+        }
+        try enforceRateLimit()
+        
+        isLoading = true
+        defer { isLoading = false }
+        
+        let requestEvent = try NostrEvent.nwcRequest(
+            method: .getInfo,
+            walletPubkey: connection.uri.walletPubkey,
+            clientSecret: connection.uri.secret,
+            encryption: try resolveEncryption()
+        )
+        
+        let response = try await sendRequestAndWaitForResponse(requestEvent)
+        
+        let decryptedContent = try response.decryptNWCContent(
+            with: connection.uri.secret,
+            peerPubkey: connection.uri.walletPubkey
+        )
+        
+        let responseData = try JSONDecoder().decode(NWCResponse.self, from: Data(decryptedContent.utf8))
+        
+        if let error = responseData.error {
+            throw error
+        }
+        
+        guard let result = responseData.result else {
+            throw NWCError(code: .other, message: "Invalid response format: missing result")
+        }
+        
+        // Parse methods
+        var methods: [NWCMethod] = []
+        if let methodStrings = result["methods"]?.value as? [String] {
+            methods = methodStrings.compactMap { NWCMethod(rawValue: $0) }
+        } else if let methodStrings = result["methods"]?.value as? [Any] {
+            methods = methodStrings.compactMap { 
+                guard let str = $0 as? String else { return nil }
+                return NWCMethod(rawValue: str)
+            }
+        }
+        
+        // Parse notifications
+        var notifications: [NWCNotificationType] = []
+        if let notifStrings = result["notifications"]?.value as? [String] {
+            notifications = notifStrings.compactMap { NWCNotificationType(rawValue: $0) }
+        } else if let notifStrings = result["notifications"]?.value as? [Any] {
+            notifications = notifStrings.compactMap {
+                guard let str = $0 as? String else { return nil }
+                return NWCNotificationType(rawValue: str)
+            }
+        }
+        
+        // Parse block height
+        var blockHeight: Int?
+        if let height = result["block_height"]?.value as? Int {
+            blockHeight = height
+        } else if let height = extractInt64(from: result["block_height"]) {
+            blockHeight = Int(height)
+        }
+        
+        return WalletInfo(
+            alias: result["alias"]?.value as? String,
+            color: result["color"]?.value as? String,
+            pubkey: result["pubkey"]?.value as? String,
+            network: result["network"]?.value as? String,
+            blockHeight: blockHeight,
+            blockHash: result["block_hash"]?.value as? String,
+            methods: methods,
+            notifications: notifications
+        )
+    }
+    
+    // MARK: - Batch Payment Operations
+    
+    /// An individual invoice in a multi-pay batch.
+    public struct BatchInvoice: Sendable {
+        /// Optional identifier for tracking this invoice in responses.
+        public let id: String?
+        
+        /// The BOLT11 invoice to pay.
+        public let invoice: String
+        
+        /// Optional amount override in millisatoshis (for zero-amount invoices).
+        public let amount: Int64?
+        
+        /// Creates a batch invoice entry.
+        ///
+        /// - Parameters:
+        ///   - id: Optional identifier for tracking
+        ///   - invoice: BOLT11 invoice string
+        ///   - amount: Optional amount override in millisats
+        public init(id: String? = nil, invoice: String, amount: Int64? = nil) {
+            self.id = id
+            self.invoice = invoice
+            self.amount = amount
+        }
+    }
+    
+    /// Result of a batch payment operation for a single invoice.
+    public struct BatchPaymentResult: Sendable {
+        /// The identifier used for this invoice (either provided id or payment hash).
+        public let id: String
+        
+        /// The payment result if successful.
+        public let result: PaymentResult?
+        
+        /// The error if payment failed.
+        public let error: NWCError?
+        
+        /// Whether this individual payment succeeded.
+        public var isSuccess: Bool { result != nil }
+    }
+    
+    /// Pays multiple invoices in a single batch operation.
+    ///
+    /// This sends all invoices to the wallet in one request. The wallet processes
+    /// them and returns individual responses for each. This is more efficient than
+    /// calling `payInvoice` multiple times.
+    ///
+    /// - Parameter invoices: Array of invoices to pay
+    ///
+    /// - Returns: Array of ``BatchPaymentResult`` for each invoice
+    ///
+    /// - Throws:
+    ///   - ``NWCError/notImplemented``: Wallet doesn't support multi_pay_invoice
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    ///
+    /// - Note: Individual payments may fail while others succeed. Check each result.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// let invoices = [
+    ///     BatchInvoice(id: "tip1", invoice: "lnbc1000n1..."),
+    ///     BatchInvoice(id: "tip2", invoice: "lnbc2000n1..."),
+    ///     BatchInvoice(id: "tip3", invoice: "lnbc3000n1...")
+    /// ]
+    ///
+    /// let results = try await walletManager.multiPayInvoice(invoices)
+    ///
+    /// for result in results {
+    ///     if result.isSuccess {
+    ///         print("\(result.id): Paid successfully")
+    ///     } else if let error = result.error {
+    ///         print("\(result.id): Failed - \(error.message)")
+    ///     }
+    /// }
+    /// ```
+    public func multiPayInvoice(_ invoices: [BatchInvoice]) async throws -> [BatchPaymentResult] {
+        guard let connection = activeConnection else {
+            throw NWCError(code: .unauthorized, message: "No active wallet connection")
+        }
+        guard supportsMethod(.multiPayInvoice) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support multi_pay_invoice")
+        }
+        guard !invoices.isEmpty else {
+            return []
+        }
+        try enforceRateLimit()
+        
+        isLoading = true
+        defer { isLoading = false }
+        
+        // Build invoices array
+        let invoicesParams: [[String: AnyCodable]] = invoices.map { inv in
+            var dict: [String: AnyCodable] = ["invoice": AnyCodable(inv.invoice)]
+            if let id = inv.id {
+                dict["id"] = AnyCodable(id)
+            }
+            if let amount = inv.amount {
+                dict["amount"] = AnyCodable(amount)
+            }
+            return dict
+        }
+        
+        let params: [String: AnyCodable] = ["invoices": AnyCodable(invoicesParams)]
+        
+        let requestEvent = try NostrEvent.nwcRequest(
+            method: .multiPayInvoice,
+            params: params,
+            walletPubkey: connection.uri.walletPubkey,
+            clientSecret: connection.uri.secret,
+            encryption: try resolveEncryption()
+        )
+        
+        // For multi_pay, we need to collect multiple response events
+        // Each response has a 'd' tag with the invoice id
+        return try await collectMultiPayResponses(
+            request: requestEvent,
+            expectedCount: invoices.count,
+            connection: connection
+        )
+    }
+    
+    /// An individual keysend in a multi-pay batch.
+    public struct BatchKeysend: Sendable {
+        /// Optional identifier for tracking this keysend in responses.
+        public let id: String?
+        
+        /// The recipient node's public key.
+        public let pubkey: String
+        
+        /// Amount to send in millisatoshis.
+        public let amount: Int64
+        
+        /// Optional custom preimage.
+        public let preimage: String?
+        
+        /// Optional TLV records.
+        public let tlvRecords: [TLVRecord]?
+        
+        /// Creates a batch keysend entry.
+        public init(
+            id: String? = nil,
+            pubkey: String,
+            amount: Int64,
+            preimage: String? = nil,
+            tlvRecords: [TLVRecord]? = nil
+        ) {
+            self.id = id
+            self.pubkey = pubkey
+            self.amount = amount
+            self.preimage = preimage
+            self.tlvRecords = tlvRecords
+        }
+    }
+    
+    /// Sends multiple keysend payments in a single batch operation.
+    ///
+    /// - Parameter keysends: Array of keysend payments to make
+    ///
+    /// - Returns: Array of ``BatchPaymentResult`` for each keysend
+    ///
+    /// - Throws:
+    ///   - ``NWCError/notImplemented``: Wallet doesn't support multi_pay_keysend
+    ///   - ``NWCError/unauthorized``: No active wallet connection
+    public func multiPayKeysend(_ keysends: [BatchKeysend]) async throws -> [BatchPaymentResult] {
+        guard let connection = activeConnection else {
+            throw NWCError(code: .unauthorized, message: "No active wallet connection")
+        }
+        guard supportsMethod(.multiPayKeysend) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support multi_pay_keysend")
+        }
+        guard !keysends.isEmpty else {
+            return []
+        }
+        try enforceRateLimit()
+        
+        isLoading = true
+        defer { isLoading = false }
+        
+        // Build keysends array
+        let keysendsParams: [[String: AnyCodable]] = keysends.map { ks in
+            var dict: [String: AnyCodable] = [
+                "pubkey": AnyCodable(ks.pubkey),
+                "amount": AnyCodable(ks.amount)
+            ]
+            if let id = ks.id {
+                dict["id"] = AnyCodable(id)
+            }
+            if let preimage = ks.preimage {
+                dict["preimage"] = AnyCodable(preimage)
+            }
+            if let tlvRecords = ks.tlvRecords, !tlvRecords.isEmpty {
+                let tlvArray = tlvRecords.map { record in
+                    ["type": AnyCodable(record.type), "value": AnyCodable(record.value)]
+                }
+                dict["tlv_records"] = AnyCodable(tlvArray)
+            }
+            return dict
+        }
+        
+        let params: [String: AnyCodable] = ["keysends": AnyCodable(keysendsParams)]
+        
+        let requestEvent = try NostrEvent.nwcRequest(
+            method: .multiPayKeysend,
+            params: params,
+            walletPubkey: connection.uri.walletPubkey,
+            clientSecret: connection.uri.secret,
+            encryption: try resolveEncryption()
+        )
+        
+        return try await collectMultiPayResponses(
+            request: requestEvent,
+            expectedCount: keysends.count,
+            connection: connection
+        )
+    }
+    
+    /// Collects multiple response events for batch payment operations.
+    private func collectMultiPayResponses(
+        request: NostrEvent,
+        expectedCount: Int,
+        connection: WalletConnection
+    ) async throws -> [BatchPaymentResult] {
+        // Subscribe to responses
+        let filter = Filter(
+            authors: [connection.uri.walletPubkey],
+            kinds: [EventKind.nwcResponse.rawValue],
+            e: [request.id]
+        )
+        
+        let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
+        subscriptions[request.id] = subscription.id
+        
+        // Publish request
+        let publishResults = await relayPool.publish(request)
+        guard publishResults.contains(where: { $0.success }) else {
+            await relayPool.closeSubscription(id: subscription.id)
+            subscriptions.removeValue(forKey: request.id)
+            throw NWCError(code: .other, message: "Failed to publish request to any relay")
+        }
+        
+        // Collect responses with timeout
+        var results: [BatchPaymentResult] = []
+        let walletPubkey = connection.uri.walletPubkey
+        let secret = connection.uri.secret
+        
+        do {
+            try await withThrowingTaskGroup(of: [BatchPaymentResult].self) { group in
+                // Response collection task
+                group.addTask {
+                    var collected: [BatchPaymentResult] = []
+                    for await event in subscription.events {
+                        guard event.pubkey == walletPubkey else { continue }
+                        guard event.kind == EventKind.nwcResponse.rawValue else { continue }
+                        
+                        // Parse this response
+                        if let result = try? await self.parseMultiPayResponse(event, secret: secret, walletPubkey: walletPubkey) {
+                            collected.append(result)
+                            if collected.count >= expectedCount {
+                                break
+                            }
+                        }
+                    }
+                    return collected
+                }
+                
+                // Timeout task (60 seconds for batch operations)
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 60_000_000_000)
+                    return []
+                }
+                
+                if let first = try await group.next(), !first.isEmpty {
+                    results = first
+                    group.cancelAll()
+                }
+            }
+        } catch {
+            // Timeout or cancellation - return what we have
+        }
+        
+        await relayPool.closeSubscription(id: subscription.id)
+        subscriptions.removeValue(forKey: request.id)
+        
+        return results
+    }
+    
+    private func parseMultiPayResponse(
+        _ event: NostrEvent,
+        secret: String,
+        walletPubkey: String
+    ) async throws -> BatchPaymentResult {
+        let decryptedContent = try event.decryptNWCContent(
+            with: secret,
+            peerPubkey: walletPubkey
+        )
+        
+        let responseData = try JSONDecoder().decode(NWCResponse.self, from: Data(decryptedContent.utf8))
+        
+        // Get the 'd' tag for the id
+        let dTag = event.tags.first { $0.count >= 2 && $0[0] == "d" }
+        let id = dTag?[1] ?? "unknown"
+        
+        if let error = responseData.error {
+            return BatchPaymentResult(id: id, result: nil, error: error)
+        }
+        
+        guard let result = responseData.result,
+              let preimage = result["preimage"]?.value as? String else {
+            return BatchPaymentResult(
+                id: id,
+                result: nil,
+                error: NWCError(code: .other, message: "Invalid response format")
+            )
+        }
+        
+        let paymentResult = PaymentResult(
+            preimage: preimage,
+            feesPaid: extractInt64(from: result["fees_paid"]),
+            paymentHash: nil
+        )
+        
+        return BatchPaymentResult(id: id, result: paymentResult, error: nil)
+    }
+    
     // MARK: - Private Methods
     
     /// Extracts an Int64 value from an AnyCodable, handling various numeric types.
@@ -1194,6 +1991,94 @@ public class WalletConnectManager: ObservableObject {
         } catch {
             nwcLogger.error("Failed to handle notification", error: error)
         }
+    }
+    
+    // MARK: - Automatic Reconnection
+    
+    /// Enables or disables automatic reconnection.
+    ///
+    /// When enabled, the manager will automatically attempt to reconnect
+    /// if the connection is lost due to network issues.
+    ///
+    /// - Parameter enabled: Whether to enable auto-reconnection
+    public func setAutoReconnect(enabled: Bool) {
+        isAutoReconnectEnabled = enabled
+        if !enabled {
+            cancelReconnection()
+        }
+    }
+    
+    /// Cancels any pending reconnection attempts.
+    public func cancelReconnection() {
+        reconnectionTask?.cancel()
+        reconnectionTask = nil
+        reconnectionAttempts = 0
+    }
+    
+    /// Schedules an automatic reconnection attempt with exponential backoff.
+    ///
+    /// This is called internally when connection failures are detected.
+    private func scheduleReconnection() {
+        guard isAutoReconnectEnabled else { return }
+        guard activeConnection != nil else { return }
+        guard reconnectionAttempts < Self.maxReconnectionAttempts else {
+            nwcLogger.error("Maximum reconnection attempts reached", metadata: LogMetadata([
+                "attempts": String(reconnectionAttempts)
+            ]))
+            connectionState = .failed(NWCError(code: .other, message: "Connection failed after \(reconnectionAttempts) attempts"))
+            return
+        }
+        
+        // Cancel any existing reconnection task
+        reconnectionTask?.cancel()
+        
+        // Calculate delay with exponential backoff and jitter
+        let baseDelay = Self.baseReconnectionDelay * pow(2.0, Double(reconnectionAttempts))
+        let jitter = Double.random(in: 0...0.3) * baseDelay
+        let delay = min(baseDelay + jitter, Self.maxReconnectionDelay)
+        
+        nwcLogger.info("Scheduling reconnection", metadata: LogMetadata([
+            "attempt": String(reconnectionAttempts + 1),
+            "delay_seconds": String(format: "%.1f", delay)
+        ]))
+        
+        reconnectionTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                
+                guard !Task.isCancelled else { return }
+                guard let self = self else { return }
+                
+                self.reconnectionAttempts += 1
+                
+                do {
+                    try await self.reconnect()
+                    // Success - reset attempts
+                    self.reconnectionAttempts = 0
+                    nwcLogger.info("Reconnection successful")
+                } catch {
+                    nwcLogger.warning("Reconnection attempt failed: \(error.localizedDescription)", metadata: LogMetadata([
+                        "attempt": String(self.reconnectionAttempts)
+                    ]))
+                    // Schedule next attempt
+                    self.scheduleReconnection()
+                }
+            } catch {
+                // Task was cancelled or sleep failed
+            }
+        }
+    }
+    
+    /// Handles connection state changes and triggers reconnection if needed.
+    ///
+    /// Call this when detecting connection loss (e.g., WebSocket disconnect).
+    public func handleConnectionLost() {
+        guard case .connected = connectionState else { return }
+        
+        connectionState = .disconnected
+        nwcLogger.warning("Connection lost, attempting to reconnect")
+        
+        scheduleReconnection()
     }
     
     // MARK: - Persistence
