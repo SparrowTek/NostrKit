@@ -48,6 +48,11 @@ NostrKit provides a complete set of tools for integrating Nostr protocol functio
 - <doc:NIP47WalletConnect>
 - ``WalletConnectManager``
 
+### Remote Signing
+
+- <doc:GettingStartedWithRemoteSigning>
+- ``RemoteSignerManager``
+
 ### Advanced Features
 
 - ``RelayDiscovery``

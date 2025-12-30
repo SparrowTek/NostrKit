@@ -1,33 +1,6 @@
 {
-  "originHash" : "51ab0be193c12d875920ec1de3a5daf9764526ac7040cdbeda5403dc6c3f438e",
+  "originHash" : "7c280e85a02fa9727facdd52ede8e0f647d5a20abfd38b7aa3444dc95fd0769f",
   "pins" : [
-    {
-      "identity" : "bdk-swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/bitcoindevkit/bdk-swift.git",
-      "state" : {
-        "revision" : "4b0945bc9a740fa4460d11b37cee4ef39c6e1697",
-        "version" : "2.2.1"
-      }
-    },
-    {
-      "identity" : "bigint",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/attaswift/BigInt.git",
-      "state" : {
-        "revision" : "e07e00fa1fd435143a2dcf8b7eec9a7710b2fdfe",
-        "version" : "5.7.0"
-      }
-    },
-    {
-      "identity" : "corenostr",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/SparrowTek/CoreNostr.git",
-      "state" : {
-        "branch" : "main",
-        "revision" : "cfe6cf482d113cd9183c636131c89ab367a350e5"
-      }
-    },
     {
       "identity" : "swift-asn1",
       "kind" : "remoteSourceControl",
@@ -53,24 +26,6 @@
       "state" : {
         "revision" : "8c62aba8a3011c9bcea232e5ee007fb0b34a15e2",
         "version" : "0.21.1"
-      }
-    },
-    {
-      "identity" : "swiftcbor",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/valpackett/SwiftCBOR.git",
-      "state" : {
-        "revision" : "04ccff117f6549121d5721ec84fdf0162122b90e",
-        "version" : "0.5.0"
-      }
-    },
-    {
-      "identity" : "vault",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/SparrowTek/Vault.git",
-      "state" : {
-        "revision" : "25df48f62a5382c217cfe67f2a12e6efe8f60ec4",
-        "version" : "1.2.0"
       }
     }
   ],

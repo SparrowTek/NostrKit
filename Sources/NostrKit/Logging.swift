@@ -109,6 +109,7 @@ public enum LogCategory: String, CaseIterable, Sendable {
     case keystore = "KeyStore"
     case pool = "Pool"
     case nwc = "NWC"
+    case nip46 = "NIP46"
     case performance = "Performance"
     case error = "Error"
     case debug = "Debug"
@@ -247,6 +248,7 @@ public let cryptoLogger = NostrKitLogger(category: .crypto)
 public let keystoreLogger = NostrKitLogger(category: .keystore)
 public let poolLogger = NostrKitLogger(category: .pool)
 public let nwcLogger = NostrKitLogger(category: .nwc)
+public let nip46Logger = NostrKitLogger(category: .nip46)
 public let performanceLogger = NostrKitLogger(category: .performance)
 public let errorLogger = NostrKitLogger(category: .error)
 public let debugLogger = NostrKitLogger(category: .debug)
