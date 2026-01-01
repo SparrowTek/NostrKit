@@ -1782,32 +1782,53 @@ public class WalletConnectManager {
             kinds: [EventKind.nwcInfo.rawValue],
             limit: 1
         )
-        
+
         // Subscribe and collect info event
-            let subscription = try await relayPool.walletSubscribe(
-                filters: [filter],
-                id: "nwc-info-\(UUID().uuidString)"
-            )
-        
+        let subscription = try await relayPool.walletSubscribe(
+            filters: [filter],
+            id: "nwc-info-\(UUID().uuidString)"
+        )
+
         var infoEvent: NostrEvent?
-        
-        // Collect events with timeout
-        let timeoutTask = Task {
-            try await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
+
+        // Use TaskGroup for proper timeout handling - when one task completes, cancel the other
+        do {
+            infoEvent = try await withThrowingTaskGroup(of: NostrEvent?.self) { group in
+                // Task 1: Listen for info events
+                group.addTask {
+                    for await event in subscription.events {
+                        // Return the first matching event
+                        return event
+                    }
+                    // Stream ended without finding an event
+                    return nil
+                }
+
+                // Task 2: Timeout after 5 seconds
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    return nil
+                }
+
+                // Wait for the first task to complete and cancel the other
+                if let result = try await group.next() {
+                    group.cancelAll()
+                    return result
+                }
+
+                return nil
+            }
+        } catch {
+            // Timeout or cancellation - no info event found
+            infoEvent = nil
         }
-        
-        for await event in subscription.events {
-            infoEvent = event
-            break
-        }
-        
-        timeoutTask.cancel()
+
         await relayPool.closeSubscription(id: subscription.id)
-        
+
         guard let event = infoEvent else {
             return nil
         }
-        
+
         return NWCInfo(content: event.content, tags: event.tags)
     }
     
