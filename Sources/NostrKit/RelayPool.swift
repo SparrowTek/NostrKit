@@ -544,13 +544,34 @@ public actor RelayPool {
     }
     
     private func monitorRelay(url: String) async {
-        guard let relay = relays[url] else { return }
-        
+        guard let relay = relays[url] else {
+            print("[RelayPool] monitorRelay: relay not found for \(url)")
+            return
+        }
+
+        print("[RelayPool] monitorRelay started for \(url)")
+
         for await message in relay.service.messages {
+            // Debug: log all received messages
+            switch message {
+            case .event(let subId, let event):
+                print("[RelayPool] Received EVENT from \(url) - subId: \(subId), eventId: \(event.id), kind: \(event.kind)")
+            case .ok(let eventId, let accepted, _):
+                print("[RelayPool] Received OK from \(url) - eventId: \(eventId), accepted: \(accepted)")
+            case .eose(let subId):
+                print("[RelayPool] Received EOSE from \(url) - subId: \(subId)")
+            case .auth:
+                print("[RelayPool] Received AUTH from \(url)")
+            case .notice(let notice):
+                print("[RelayPool] Received NOTICE from \(url): \(notice)")
+            case .closed(let subId, let msg):
+                print("[RelayPool] Received CLOSED from \(url) - subId: \(subId), msg: \(msg ?? "none")")
+            }
+
             // Update statistics
             if var updatedRelay = relays[url] {
                 updatedRelay.stats.lastActivity = Date()
-                
+
                 switch message {
                 case .event:
                     updatedRelay.stats.eventsReceived += 1
@@ -560,7 +581,7 @@ public actor RelayPool {
                     // Check if we have a pending continuation for this event
                     if let continuation = pendingOKResponses[url]?[eventId] {
                         pendingOKResponses[url]?.removeValue(forKey: eventId)
-                        
+
                         // Resume the continuation with the result
                         continuation.resume(returning: PublishResult(
                             relay: url,
@@ -569,7 +590,7 @@ public actor RelayPool {
                             error: accepted ? nil : RelayError.eventRejected(reason: message)
                         ))
                     }
-                    
+
                     if !accepted {
                         print("[RelayPool] Event rejected by \(url): \(message ?? "No reason")")
                         await updateHealthScore(for: url, eventType: .eventRejected)
@@ -579,15 +600,18 @@ public actor RelayPool {
                 default:
                     break
                 }
-                
+
                 relays[url] = updatedRelay
             }
-            
+
             // Forward message to relevant subscriptions
+            print("[RelayPool] Forwarding message to \(subscriptions.count) subscriptions")
             for subscription in subscriptions.values {
                 await subscription.handleMessage(message, from: url)
             }
         }
+
+        print("[RelayPool] monitorRelay loop ended for \(url)")
         
         // Connection dropped
         if var relay = relays[url] {
@@ -751,23 +775,32 @@ public actor PoolSubscription {
     
     func handleMessage(_ message: RelayMessage, from url: String) async {
         switch message {
-        case .event(let subId, let event) where subId == id:
-            // Deduplicate events
-            if !seenEventIds.contains(event.id) {
-                seenEventIds.insert(event.id)
-                eventSubject.continuation.yield(event)
+        case .event(let subId, let event):
+            print("[PoolSubscription:\(id.prefix(8))] Checking event - subId: \(subId), myId: \(id), match: \(subId == id)")
+            if subId == id {
+                // Deduplicate events
+                if !seenEventIds.contains(event.id) {
+                    seenEventIds.insert(event.id)
+                    print("[PoolSubscription:\(id.prefix(8))] Yielding event to stream - kind: \(event.kind), id: \(event.id.prefix(16))")
+                    eventSubject.continuation.yield(event)
+                } else {
+                    print("[PoolSubscription:\(id.prefix(8))] Duplicate event ignored")
+                }
             }
-            
-        case .eose(let subId) where subId == id:
-            relaySubscriptions[url] = true
-            
-            // Check if all relays have sent EOSE
-            let allEOSE = relaySubscriptions.values.allSatisfy { $0 }
-            if allEOSE {
-                // All relays have sent their stored events
-                await pool?.delegate?.relayPool(pool!, subscription: id, receivedEOSEFromAllRelays: true)
+
+        case .eose(let subId):
+            print("[PoolSubscription:\(id.prefix(8))] Checking EOSE - subId: \(subId), myId: \(id), match: \(subId == id)")
+            if subId == id {
+                relaySubscriptions[url] = true
+
+                // Check if all relays have sent EOSE
+                let allEOSE = relaySubscriptions.values.allSatisfy { $0 }
+                if allEOSE {
+                    // All relays have sent their stored events
+                    await pool?.delegate?.relayPool(pool!, subscription: id, receivedEOSEFromAllRelays: true)
+                }
             }
-            
+
         default:
             break
         }
