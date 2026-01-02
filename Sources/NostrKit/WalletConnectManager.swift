@@ -396,43 +396,85 @@ public class WalletConnectManager {
         guard let nwcURI = NWCConnectionURI(from: uri) else {
             throw NWCError(code: .other, message: "Invalid NWC URI")
         }
-        
+
+        // Check if already connected to this wallet and relay is connected
+        if let existingIndex = connections.firstIndex(where: { $0.uri.walletPubkey == nwcURI.walletPubkey }) {
+            // Already have a connection to this wallet
+            if activeConnection?.uri.walletPubkey == nwcURI.walletPubkey,
+               case .connected = connectionState {
+                // Already active and connected, nothing to do
+                print("[NWC] Already connected to this wallet, skipping")
+                return
+            }
+
+            // Reconnect to existing connection but refresh capabilities
+            connectionState = .connecting
+            isLoading = true
+            defer { isLoading = false }
+
+            do {
+                // Connect to relays
+                for relay in nwcURI.relays {
+                    try await relayPool.addRelay(url: relay)
+                }
+                await relayPool.connectAll()
+
+                // Refresh capabilities (they may be stale from keychain)
+                if let info = try await fetchWalletInfo(walletPubkey: nwcURI.walletPubkey) {
+                    connections[existingIndex].capabilities = info
+                    print("[NWC] Refreshed capabilities - encryption: \(info.encryptionSchemes), methods: \(info.methods)")
+                    await saveConnections()
+                }
+
+                // Set as active
+                activeConnection = connections[existingIndex]
+                await saveActiveConnection()
+
+                connectionState = .connected
+                await subscribeToNotifications()
+            } catch {
+                connectionState = .failed(error)
+                lastError = error
+                throw error
+            }
+            return
+        }
+
         connectionState = .connecting
         isLoading = true
         defer { isLoading = false }
-        
+
         do {
             // Add relays to the pool
             for relay in nwcURI.relays {
                 try await relayPool.addRelay(url: relay)
             }
-            
+
             // Connect to relays
             await relayPool.connectAll()
-            
+
             // Create and store connection
             var connection = WalletConnection(uri: nwcURI, alias: alias)
-            
+
             // Fetch wallet capabilities
             if let info = try await fetchWalletInfo(walletPubkey: nwcURI.walletPubkey) {
                 connection.capabilities = info
+                print("[NWC] Stored capabilities - encryption: \(info.encryptionSchemes), methods: \(info.methods)")
             }
-            
+
             // Store connection
             connections.append(connection)
             await saveConnections()
-            
-            // Set as active if it's the first connection
-            if activeConnection == nil {
-                activeConnection = connection
-                await saveActiveConnection()
-            }
-            
+
+            // Always set as active for new connections
+            activeConnection = connection
+            await saveActiveConnection()
+
             connectionState = .connected
-            
+
             // Subscribe to notifications
             await subscribeToNotifications()
-            
+
         } catch {
             connectionState = .failed(error)
             lastError = error
@@ -1335,25 +1377,43 @@ public class WalletConnectManager {
             throw NWCError(code: .notImplemented, message: "Wallet does not support get_info")
         }
         try enforceRateLimit()
-        
+
         isLoading = true
         defer { isLoading = false }
-        
+
         let requestEvent = try NostrEvent.nwcRequest(
             method: .getInfo,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
             encryption: try resolveEncryption()
         )
-        
+
         let response = try await sendRequestAndWaitForResponse(requestEvent)
-        
-        let decryptedContent = try response.decryptNWCContent(
-            with: connection.uri.secret,
-            peerPubkey: connection.uri.walletPubkey
-        )
-        
-        let responseData = try JSONDecoder().decode(NWCResponse.self, from: Data(decryptedContent.utf8))
+
+        print("[NWC] getInfo: Response received, attempting to decrypt...")
+        print("[NWC] getInfo: Response content length: \(response.content.count)")
+
+        let decryptedContent: String
+        do {
+            decryptedContent = try response.decryptNWCContent(
+                with: connection.uri.secret,
+                peerPubkey: connection.uri.walletPubkey
+            )
+            print("[NWC] getInfo: Decryption successful, content: \(decryptedContent.prefix(200))...")
+        } catch {
+            print("[NWC] getInfo: Decryption FAILED: \(error)")
+            throw error
+        }
+
+        let responseData: NWCResponse
+        do {
+            responseData = try JSONDecoder().decode(NWCResponse.self, from: Data(decryptedContent.utf8))
+            print("[NWC] getInfo: JSON decode successful, result_type: \(responseData.resultType)")
+        } catch {
+            print("[NWC] getInfo: JSON decode FAILED: \(error)")
+            print("[NWC] getInfo: Raw decrypted content: \(decryptedContent)")
+            throw error
+        }
         
         if let error = responseData.error {
             throw error
@@ -1762,16 +1822,21 @@ public class WalletConnectManager {
     
     private func resolveEncryption() throws -> NWCEncryption {
         guard let capabilities = activeConnection?.capabilities else {
+            print("[NWC] No capabilities found, defaulting to NIP-44")
             return .nip44
         }
-        
+
+        print("[NWC] Wallet encryption schemes: \(capabilities.encryptionSchemes)")
+
         if capabilities.encryptionSchemes.contains(.nip44) {
+            print("[NWC] Using NIP-44 encryption")
             return .nip44
         }
         if capabilities.encryptionSchemes.contains(.nip04) {
+            print("[NWC] Using NIP-04 encryption")
             return .nip04
         }
-        
+
         throw NWCError(code: .unsupportedEncryption, message: "Wallet does not support a compatible encryption scheme")
     }
     
@@ -1826,10 +1891,16 @@ public class WalletConnectManager {
         await relayPool.closeSubscription(id: subscription.id)
 
         guard let event = infoEvent else {
+            print("[NWC] No wallet info event received")
             return nil
         }
 
-        return NWCInfo(content: event.content, tags: event.tags)
+        print("[NWC] Wallet info event content: \(event.content)")
+        print("[NWC] Wallet info event tags: \(event.tags)")
+
+        let info = NWCInfo(content: event.content, tags: event.tags)
+        print("[NWC] Parsed wallet info - methods: \(info?.methods ?? []), encryption: \(info?.encryptionSchemes ?? [])")
+        return info
     }
     
     /// Timeout duration for NWC requests (30 seconds)
@@ -1839,25 +1910,30 @@ public class WalletConnectManager {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
         }
-        
-        nwcLogger.debug("Publishing NWC request", metadata: LogMetadata([
-            "request_id": request.id,
-            "wallet": connection.uri.walletPubkey
-        ]))
-        
+
+        print("[NWC] Publishing request - id: \(request.id.prefix(16)), kind: \(request.kind)")
+        print("[NWC] Request tags: \(request.tags)")
+        print("[NWC] Wallet pubkey: \(connection.uri.walletPubkey.prefix(16))...")
+
         // Prepare subscription first to avoid missing early responses
         let filter = Filter(
             authors: [connection.uri.walletPubkey],
             kinds: [EventKind.nwcResponse.rawValue],
             e: [request.id]
         )
-        
+
+        print("[NWC] Subscribing for response - filter authors: \(filter.authors ?? []), kinds: \(filter.kinds ?? []), e: \(filter.e ?? [])")
+
         let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
         subscriptions[request.id] = subscription.id
-        
+
+        print("[NWC] Subscription created - id: \(subscription.id.prefix(16))")
+
         // Publish request
         let publishResults = await relayPool.publish(request)
-        
+
+        print("[NWC] Publish results: \(publishResults.map { "[\($0.relay): success=\($0.success), msg=\($0.message ?? "none")]" }.joined(separator: ", "))")
+
         // Check if at least one relay accepted the event
         guard publishResults.contains(where: { $0.success }) else {
             await relayPool.closeSubscription(id: subscription.id)
@@ -1876,19 +1952,33 @@ public class WalletConnectManager {
             let result = try await withThrowingTaskGroup(of: NostrEvent?.self) { group in
                 // Task 1: Listen for response events
                 group.addTask {
+                    print("[NWC] Starting to listen for response events...")
                     for await event in subscription.events {
+                        print("[NWC] TaskGroup received event - id: \(event.id.prefix(16)), kind: \(event.kind), pubkey: \(event.pubkey.prefix(16))...")
+
                         // Verify event is from the wallet
-                        guard event.pubkey == walletPubkey else { continue }
-                        // Verify correct event kind
-                        guard event.kind == EventKind.nwcResponse.rawValue else { continue }
-                        // Verify this is a response to our request (via 'e' tag)
-                        guard event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == requestId }) else {
+                        guard event.pubkey == walletPubkey else {
+                            print("[NWC] Pubkey mismatch - expected: \(walletPubkey.prefix(16))..., got: \(event.pubkey.prefix(16))...")
                             continue
                         }
-                        
+                        // Verify correct event kind
+                        guard event.kind == EventKind.nwcResponse.rawValue else {
+                            print("[NWC] Kind mismatch - expected: \(EventKind.nwcResponse.rawValue), got: \(event.kind)")
+                            continue
+                        }
+                        // Verify this is a response to our request (via 'e' tag)
+                        let eTags = event.tags.filter { $0.count >= 2 && $0[0] == "e" }
+                        print("[NWC] Event e-tags: \(eTags), looking for requestId: \(requestId.prefix(16))...")
+                        guard event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == requestId }) else {
+                            print("[NWC] Request ID not found in e-tags")
+                            continue
+                        }
+
+                        print("[NWC] Event verified! Returning response")
                         return event
                     }
                     // Stream ended without finding a matching event
+                    print("[NWC] Event stream ended without finding matching event")
                     return nil
                 }
                 
@@ -2108,16 +2198,24 @@ public class WalletConnectManager {
     private func loadConnections() async {
         do {
             let data = try await keychain.load(key: Self.connectionsKey)
-            connections = try JSONDecoder().decode([WalletConnection].self, from: data)
-            
-            // Load active connection
-            if let activeData = try? await keychain.load(key: Self.activeConnectionKey) {
-                let activeId = String(data: activeData, encoding: .utf8)
+            let loadedConnections = try JSONDecoder().decode([WalletConnection].self, from: data)
+
+            // Merge loaded connections with any that were added during connect()
+            // This handles the race condition where connect() runs before loadConnections()
+            for loaded in loadedConnections {
+                if !connections.contains(where: { $0.id == loaded.id }) {
+                    connections.append(loaded)
+                }
+            }
+
+            // Only load active connection if one isn't already set (connect() might have set it)
+            if activeConnection == nil,
+               let activeData = try? await keychain.load(key: Self.activeConnectionKey),
+               let activeId = String(data: activeData, encoding: .utf8) {
                 activeConnection = connections.first { $0.id == activeId }
             }
         } catch {
-            // No saved connections
-            connections = []
+            // No saved connections - keep any that were added during connect()
         }
     }
     
