@@ -403,7 +403,6 @@ public class WalletConnectManager {
             if activeConnection?.uri.walletPubkey == nwcURI.walletPubkey,
                case .connected = connectionState {
                 // Already active and connected, nothing to do
-                print("[NWC] Already connected to this wallet, skipping")
                 return
             }
 
@@ -422,7 +421,6 @@ public class WalletConnectManager {
                 // Refresh capabilities (they may be stale from keychain)
                 if let info = try await fetchWalletInfo(walletPubkey: nwcURI.walletPubkey) {
                     connections[existingIndex].capabilities = info
-                    print("[NWC] Refreshed capabilities - encryption: \(info.encryptionSchemes), methods: \(info.methods)")
                     await saveConnections()
                 }
 
@@ -459,7 +457,6 @@ public class WalletConnectManager {
             // Fetch wallet capabilities
             if let info = try await fetchWalletInfo(walletPubkey: nwcURI.walletPubkey) {
                 connection.capabilities = info
-                print("[NWC] Stored capabilities - encryption: \(info.encryptionSchemes), methods: \(info.methods)")
             }
 
             // Store connection
@@ -1390,30 +1387,12 @@ public class WalletConnectManager {
 
         let response = try await sendRequestAndWaitForResponse(requestEvent)
 
-        print("[NWC] getInfo: Response received, attempting to decrypt...")
-        print("[NWC] getInfo: Response content length: \(response.content.count)")
+        let decryptedContent = try response.decryptNWCContent(
+            with: connection.uri.secret,
+            peerPubkey: connection.uri.walletPubkey
+        )
 
-        let decryptedContent: String
-        do {
-            decryptedContent = try response.decryptNWCContent(
-                with: connection.uri.secret,
-                peerPubkey: connection.uri.walletPubkey
-            )
-            print("[NWC] getInfo: Decryption successful, content: \(decryptedContent.prefix(200))...")
-        } catch {
-            print("[NWC] getInfo: Decryption FAILED: \(error)")
-            throw error
-        }
-
-        let responseData: NWCResponse
-        do {
-            responseData = try JSONDecoder().decode(NWCResponse.self, from: Data(decryptedContent.utf8))
-            print("[NWC] getInfo: JSON decode successful, result_type: \(responseData.resultType)")
-        } catch {
-            print("[NWC] getInfo: JSON decode FAILED: \(error)")
-            print("[NWC] getInfo: Raw decrypted content: \(decryptedContent)")
-            throw error
-        }
+        let responseData = try JSONDecoder().decode(NWCResponse.self, from: Data(decryptedContent.utf8))
         
         if let error = responseData.error {
             throw error
@@ -1822,18 +1801,13 @@ public class WalletConnectManager {
     
     private func resolveEncryption() throws -> NWCEncryption {
         guard let capabilities = activeConnection?.capabilities else {
-            print("[NWC] No capabilities found, defaulting to NIP-44")
             return .nip44
         }
 
-        print("[NWC] Wallet encryption schemes: \(capabilities.encryptionSchemes)")
-
         if capabilities.encryptionSchemes.contains(.nip44) {
-            print("[NWC] Using NIP-44 encryption")
             return .nip44
         }
         if capabilities.encryptionSchemes.contains(.nip04) {
-            print("[NWC] Using NIP-04 encryption")
             return .nip04
         }
 
@@ -1891,16 +1865,10 @@ public class WalletConnectManager {
         await relayPool.closeSubscription(id: subscription.id)
 
         guard let event = infoEvent else {
-            print("[NWC] No wallet info event received")
             return nil
         }
 
-        print("[NWC] Wallet info event content: \(event.content)")
-        print("[NWC] Wallet info event tags: \(event.tags)")
-
-        let info = NWCInfo(content: event.content, tags: event.tags)
-        print("[NWC] Parsed wallet info - methods: \(info?.methods ?? []), encryption: \(info?.encryptionSchemes ?? [])")
-        return info
+        return NWCInfo(content: event.content, tags: event.tags)
     }
     
     /// Timeout duration for NWC requests (30 seconds)
@@ -1911,10 +1879,6 @@ public class WalletConnectManager {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
         }
 
-        print("[NWC] Publishing request - id: \(request.id.prefix(16)), kind: \(request.kind)")
-        print("[NWC] Request tags: \(request.tags)")
-        print("[NWC] Wallet pubkey: \(connection.uri.walletPubkey.prefix(16))...")
-
         // Prepare subscription first to avoid missing early responses
         let filter = Filter(
             authors: [connection.uri.walletPubkey],
@@ -1922,17 +1886,11 @@ public class WalletConnectManager {
             e: [request.id]
         )
 
-        print("[NWC] Subscribing for response - filter authors: \(filter.authors ?? []), kinds: \(filter.kinds ?? []), e: \(filter.e ?? [])")
-
         let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
         subscriptions[request.id] = subscription.id
 
-        print("[NWC] Subscription created - id: \(subscription.id.prefix(16))")
-
         // Publish request
         let publishResults = await relayPool.publish(request)
-
-        print("[NWC] Publish results: \(publishResults.map { "[\($0.relay): success=\($0.success), msg=\($0.message ?? "none")]" }.joined(separator: ", "))")
 
         // Check if at least one relay accepted the event
         guard publishResults.contains(where: { $0.success }) else {
@@ -1952,33 +1910,18 @@ public class WalletConnectManager {
             let result = try await withThrowingTaskGroup(of: NostrEvent?.self) { group in
                 // Task 1: Listen for response events
                 group.addTask {
-                    print("[NWC] Starting to listen for response events...")
                     for await event in subscription.events {
-                        print("[NWC] TaskGroup received event - id: \(event.id.prefix(16)), kind: \(event.kind), pubkey: \(event.pubkey.prefix(16))...")
-
                         // Verify event is from the wallet
-                        guard event.pubkey == walletPubkey else {
-                            print("[NWC] Pubkey mismatch - expected: \(walletPubkey.prefix(16))..., got: \(event.pubkey.prefix(16))...")
-                            continue
-                        }
+                        guard event.pubkey == walletPubkey else { continue }
                         // Verify correct event kind
-                        guard event.kind == EventKind.nwcResponse.rawValue else {
-                            print("[NWC] Kind mismatch - expected: \(EventKind.nwcResponse.rawValue), got: \(event.kind)")
-                            continue
-                        }
+                        guard event.kind == EventKind.nwcResponse.rawValue else { continue }
                         // Verify this is a response to our request (via 'e' tag)
-                        let eTags = event.tags.filter { $0.count >= 2 && $0[0] == "e" }
-                        print("[NWC] Event e-tags: \(eTags), looking for requestId: \(requestId.prefix(16))...")
                         guard event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == requestId }) else {
-                            print("[NWC] Request ID not found in e-tags")
                             continue
                         }
-
-                        print("[NWC] Event verified! Returning response")
                         return event
                     }
                     // Stream ended without finding a matching event
-                    print("[NWC] Event stream ended without finding matching event")
                     return nil
                 }
                 
