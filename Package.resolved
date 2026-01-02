@@ -1,6 +1,15 @@
 {
-  "originHash" : "20bdd371d16c6ff1ae9450a234b97be41c122d3e162beb1895bcbb869ca93927",
+  "originHash" : "51ab0be193c12d875920ec1de3a5daf9764526ac7040cdbeda5403dc6c3f438e",
   "pins" : [
+    {
+      "identity" : "corenostr",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/SparrowTek/CoreNostr.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "05bd75f06ba311801125b8c440ae5f1643708a26"
+      }
+    },
     {
       "identity" : "swift-asn1",
       "kind" : "remoteSourceControl",
