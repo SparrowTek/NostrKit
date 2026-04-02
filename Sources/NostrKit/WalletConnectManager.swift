@@ -899,6 +899,9 @@ public class WalletConnectManager {
     ///   - from: Optional start date for the transaction range
     ///   - until: Optional end date for the transaction range
     ///   - limit: Maximum number of transactions to return
+    ///   - offset: Offset of the first transaction to return
+    ///   - unpaid: Include unpaid invoices (default false on the wallet side)
+    ///   - type: Filter by transaction type (incoming/outgoing), nil returns both
     ///
     /// - Returns: An array of ``NWCTransaction`` objects representing the transaction history
     ///
@@ -927,7 +930,7 @@ public class WalletConnectManager {
     /// ```
     ///
     /// - Note: The transactions are also stored in ``recentTransactions`` for observation.
-    public func listTransactions(from: Date? = nil, until: Date? = nil, limit: Int? = nil) async throws -> [NWCTransaction] {
+    public func listTransactions(from: Date? = nil, until: Date? = nil, limit: Int? = nil, offset: Int? = nil, unpaid: Bool? = nil, type: NWCTransactionType? = nil) async throws -> [NWCTransaction] {
         guard let connection = activeConnection else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
         }
@@ -948,6 +951,15 @@ public class WalletConnectManager {
         }
         if let limit = limit {
             params["limit"] = AnyCodable(limit)
+        }
+        if let offset = offset {
+            params["offset"] = AnyCodable(offset)
+        }
+        if let unpaid = unpaid {
+            params["unpaid"] = AnyCodable(unpaid)
+        }
+        if let type = type {
+            params["type"] = AnyCodable(type.rawValue)
         }
         
         let requestEvent = try NostrEvent.nwcRequest(
@@ -976,10 +988,10 @@ public class WalletConnectManager {
             throw NWCError(code: .other, message: "Invalid response format")
         }
         
-        // Parse transactions
-        let transactions = try transactionsData.compactMap { txData -> NWCTransaction? in
-            let jsonData = try JSONSerialization.data(withJSONObject: txData)
-            return try JSONDecoder().decode(NWCTransaction.self, from: jsonData)
+        // Parse transactions, skipping any that fail to decode
+        let transactions = transactionsData.compactMap { txData -> NWCTransaction? in
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: txData) else { return nil }
+            return try? JSONDecoder().decode(NWCTransaction.self, from: jsonData)
         }
         
         self.recentTransactions = transactions

@@ -87,6 +87,60 @@ struct NIP47IntegrationTests {
         #expect(manager.balance == nil) // payInvoice does not update balance by itself
     }
     
+    @Test("listTransactions skips un-decodable transactions gracefully")
+    func testListTransactionsSkipsBadEntries() async throws {
+        let walletKeyPair = try KeyPair.generate()
+        let clientKeyPair = try KeyPair.generate()
+
+        let mockPool = MockRelayPool()
+        let storage = InMemoryWalletStorage()
+
+        await mockPool.setResponseFactory { request in
+            guard request.kind == EventKind.nwcRequest.rawValue else { return nil }
+
+            let validTx: [String: Any] = [
+                "type": "incoming",
+                "state": "settled",
+                "payment_hash": "abc123",
+                "amount": 50000,
+                "created_at": 1693876973
+            ]
+
+            // Malformed: missing required non-optional fields (amount, created_at)
+            let malformedTx: [String: Any] = [
+                "type": "incoming",
+                "payment_hash": "def456"
+            ]
+
+            return try? NostrEvent.nwcResponse(
+                requestId: request.id,
+                resultType: "list_transactions",
+                result: [
+                    "transactions": AnyCodable([validTx, malformedTx] as [[String: Any]])
+                ],
+                clientPubkey: clientKeyPair.publicKey,
+                walletSecret: walletKeyPair.privateKey,
+                encryption: .nip44
+            )
+        }
+
+        let connection = makeConnections(walletPubkey: walletKeyPair.publicKey, clientSecret: clientKeyPair.privateKey)
+        let manager = WalletConnectManager(
+            relayPool: mockPool,
+            keychain: storage,
+            seedConnections: [connection],
+            activeConnectionId: connection.id,
+            maxRequestsPerMinute: 10
+        )
+
+        try await manager.reconnect()
+
+        let transactions = try await manager.listTransactions()
+        #expect(transactions.count == 1)
+        #expect(transactions[0].paymentHash == "abc123")
+        #expect(transactions[0].amount == 50000)
+    }
+
     @Test("Rate limiting prevents rapid repeated requests")
     func testRateLimit() async throws {
         let walletKeyPair = try KeyPair.generate()
