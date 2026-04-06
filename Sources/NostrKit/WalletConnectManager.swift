@@ -1883,8 +1883,8 @@ public class WalletConnectManager {
         return NWCInfo(content: event.content, tags: event.tags)
     }
     
-    /// Timeout duration for NWC requests (30 seconds)
-    private static let requestTimeoutNanoseconds: UInt64 = 30_000_000_000
+    /// Timeout duration for NWC requests (60 seconds)
+    private static let requestTimeoutNanoseconds: UInt64 = 60_000_000_000
     
     private func sendRequestAndWaitForResponse(_ request: NostrEvent) async throws -> NostrEvent {
         guard let connection = activeConnection else {
