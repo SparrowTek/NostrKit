@@ -303,6 +303,7 @@ public actor RelayPool {
             relay.lastConnectedAt = Date()
             relay.failureCount = 0
             relay.lastError = nil
+            relay.healthScore = 1.0
             relays[url] = relay
             
             // Fetch relay information
@@ -382,10 +383,18 @@ public actor RelayPool {
     /// - Parameter event: The event to publish
     /// - Returns: Results from each relay
     public func publish(_ event: NostrEvent) async -> [PublishResult] {
-        let writableRelays = healthyRelays.filter { relay in
+        var writableRelays = healthyRelays.filter { relay in
             relay.metadata?.write ?? true
         }
-        
+
+        // If no healthy relays, attempt to reconnect before giving up
+        if writableRelays.isEmpty {
+            await connectAll()
+            writableRelays = healthyRelays.filter { relay in
+                relay.metadata?.write ?? true
+            }
+        }
+
         return await withTaskGroup(of: PublishResult.self) { group in
             for relay in writableRelays {
                 group.addTask {
