@@ -219,7 +219,7 @@ public struct QueryBuilder: Sendable {
             builder.filter.p = values
         default:
             // Other tags are not supported by the current Filter struct
-            print("Warning: Tag '\(name)' is not supported by Filter. Only 'e' and 'p' tags are supported.")
+            debugLogger.warning("Tag '\(name)' is not supported by Filter. Only 'e' and 'p' tags are supported.")
         }
         return builder
     }

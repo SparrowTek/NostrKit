@@ -132,7 +132,11 @@ public actor RelayService {
     
     /// The WebSocket stream for this relay
     private var stream: SocketStream?
-    
+
+    /// Handle to the listener Task, tracked so `disconnect()` can cancel it
+    /// instead of letting it leak for the process lifetime.
+    private var listenerTask: Task<Void, Never>?
+
     /// Current authentication status
     private var authStatus: AuthenticationStatus = .notAuthenticated
     
@@ -190,15 +194,18 @@ public actor RelayService {
         let task = URLSession.shared.webSocketTask(with: wsURL)
         let socketStream = SocketStream(task: task)
         self.stream = socketStream
-        
-        // Start listening for messages
-        Task {
-            await listenForMessages()
+
+        // Start listening for messages — store the handle so `disconnect()`
+        // can cancel it rather than leaking the task.
+        listenerTask = Task { [weak self] in
+            await self?.listenForMessages()
         }
     }
-    
+
     /// Disconnects from the relay
     public func disconnect() async {
+        listenerTask?.cancel()
+        listenerTask = nil
         if let stream = stream {
             try? await stream.cancel()
             self.stream = nil
@@ -267,7 +274,7 @@ public actor RelayService {
                 await handleWebSocketMessage(message)
             }
         } catch {
-            print("[RelayService] WebSocket error: \(error)")
+            relayLogger.warning("WebSocket error on \(url): \(error)")
             messageContinuation?.finish()
         }
         
@@ -295,33 +302,33 @@ public actor RelayService {
                 }
                 
             } catch {
-                print("[RelayService] Failed to decode message: \(error)")
+                relayLogger.warning("Failed to decode message from \(url): \(error)")
             }
-            
+
         case .data(let data):
-            print("[RelayService] Received unexpected binary data: \(data.count) bytes")
-            
+            relayLogger.debug("Received unexpected binary data from \(url): \(data.count) bytes")
+
         @unknown default:
-            print("[RelayService] Received unknown message type")
+            relayLogger.debug("Received unknown message type from \(url)")
         }
     }
     
     private func handleAuthChallenge(_ challenge: String) async {
         guard let authenticator = authenticator else {
-            print("[RelayService] Received auth challenge but no authenticator set")
+            relayLogger.warning("Received auth challenge from \(url) but no authenticator set")
             authStatus = .authenticationRequired(challenge: AuthChallenge(challenge: challenge, relayURL: url))
             return
         }
-        
+
         authStatus = .authenticating
-        
+
         do {
             let authChallenge = AuthChallenge(challenge: challenge, relayURL: url)
             let authResponse = try await authenticator(authChallenge)
             try await sendAuth(authResponse.event)
             authStatus = .authenticated(since: Date())
         } catch {
-            print("[RelayService] Authentication failed: \(error)")
+            relayLogger.error("Authentication failed for \(url)", error: error)
             authStatus = .failed(reason: error.localizedDescription)
         }
     }

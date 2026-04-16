@@ -887,7 +887,7 @@ public actor ProfileManager {
                 }
             } catch {
                 // If encryption fails, fall back to public list
-                print("[ProfileManager] Failed to encrypt list items: \(error)")
+                cryptoLogger.warning("ProfileManager failed to encrypt list items: \(error)")
                 content = ""
             }
         }

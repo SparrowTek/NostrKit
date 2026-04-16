@@ -3,6 +3,17 @@ import Security
 import LocalAuthentication
 
 /// A simple wrapper around iOS Keychain Services for secure storage.
+///
+/// The actor exposes a mix of synchronous and asynchronous methods: the
+/// synchronous variants call `SecItem*` APIs directly, which block the actor's
+/// executor for the duration of the Security-framework I/O. Keychain ops are
+/// fast in practice (non-biometric lookups are microseconds), and callers are
+/// low-frequency (identity load / save, permissions read), so the blocking
+/// cost is acceptable.
+///
+/// The async variants (`loadStringWithBiometrics`, `canUseBiometrics`) need to
+/// present Local Authentication UI and block for user input; they must be
+/// async because that interaction can take seconds.
 actor KeychainWrapper {
     
     enum KeychainError: Error, LocalizedError {

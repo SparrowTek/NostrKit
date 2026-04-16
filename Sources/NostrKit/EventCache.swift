@@ -444,8 +444,8 @@ public actor EventCache {
     
     /// Gets current cache statistics
     public func statistics() async -> Statistics {
-        let diskEvents = diskStorage != nil ? (try? await diskStorage!.count()) ?? 0 : 0
-        let diskSize = diskStorage != nil ? (try? await diskStorage!.size()) ?? 0 : 0
+        let diskEvents = (try? await diskStorage?.count()) ?? 0
+        let diskSize = (try? await diskStorage?.size()) ?? 0
         
         let oldestDate = timestampIndex.first?.0
         let newestDate = timestampIndex.last?.0

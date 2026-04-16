@@ -19,6 +19,7 @@ public actor ResilientRelayService: RelayServiceProtocol {
     
     private var connectionState: ConnectionState = .disconnected
     private var reconnectionTask: Task<Void, Never>?
+    private var monitoringTask: Task<Void, Never>?
     
     // Statistics tracking
     private var stats = ResilienceStatistics()
@@ -111,11 +112,16 @@ public actor ResilientRelayService: RelayServiceProtocol {
     /// Disconnects from the relay
     public func disconnect() async {
         logger.info("Disconnecting from \(self.url)")
-        
+
         // Cancel reconnection attempts
         reconnectionTask?.cancel()
         reconnectionTask = nil
-        
+
+        // Stop the monitoring loop so it doesn't keep the connection object
+        // alive after disconnect.
+        monitoringTask?.cancel()
+        monitoringTask = nil
+
         // Stop monitoring
         await heartbeatManager.stop()
         
@@ -207,15 +213,17 @@ public actor ResilientRelayService: RelayServiceProtocol {
     // MARK: - Private Methods
     
     private func startMonitoring() async {
-        // Setup message forwarding
-        Task {
-            for await message in baseService.messages {
-                await handleRelayMessage(message)
+        // Replace any prior monitoring task; cancel it so we don't end up with
+        // duplicate message-forwarding loops after a reconnection.
+        monitoringTask?.cancel()
+        monitoringTask = Task { [weak self] in
+            guard let self else { return }
+            for await message in await self.baseService.messages {
+                await self.handleRelayMessage(message)
             }
-            // Connection lost
-            await handleConnectionLost()
+            await self.handleConnectionLost()
         }
-        
+
         // Start heartbeat monitoring
         await heartbeatManager.start(
             sendPing: { [weak self] in

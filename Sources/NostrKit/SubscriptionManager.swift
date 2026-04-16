@@ -576,8 +576,7 @@ extension SubscriptionManager: RelayPoolDelegate {
     }
     
     public func relayPool(_ pool: RelayPool, relay: String, becameUnhealthyWithScore score: Double) async {
-        // Log unhealthy relay
-        print("[SubscriptionManager] Relay \(relay) became unhealthy with score \(score)")
+        subscriptionLogger.warning("Relay \(relay) became unhealthy with score \(score)")
     }
     
     public func relayPool(_ pool: RelayPool, subscription: String, receivedEOSEFromAllRelays: Bool) async {

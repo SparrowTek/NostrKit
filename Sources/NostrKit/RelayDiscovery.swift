@@ -278,7 +278,7 @@ public actor RelayDiscovery {
         for await event in await followSubscription.events {
             if event.kind == EventKind.followList.rawValue {
                 guard let followList = NostrFollowList.from(event: event) else {
-                    print("[RelayDiscovery] Failed to parse follow list")
+                    relayLogger.warning("Failed to parse follow list")
                     continue
                 }
                 followPubkeys = followList.follows.map { $0.pubkey }
@@ -357,7 +357,7 @@ extension RelayPool {
                 )
                 addedRelays.append(discoveredRelay.url)
             } catch {
-                print("[RelayPool] Failed to add relay \(discoveredRelay.url): \(error)")
+                relayLogger.warning("Failed to add relay \(discoveredRelay.url): \(error)")
             }
         }
         

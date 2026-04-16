@@ -187,6 +187,10 @@ public actor RelayPool {
     
     /// Pending OK responses tracked by relay URL and event ID
     private var pendingOKResponses: [String: [EventID: CheckedContinuation<PublishResult, Never>]] = [:]
+
+    /// Monitor tasks per relay URL, so they can be cancelled when the relay
+    /// is removed (or when the whole pool shuts down) instead of leaking.
+    private var monitorTasks: [String: Task<Void, Never>] = [:]
     
     /// Configuration for the relay pool
     public let configuration: Configuration
@@ -245,12 +249,14 @@ public actor RelayPool {
         )
         
         relays[url] = relay
-        
-        // Start monitoring this relay
-        Task {
-            await monitorRelay(url: url)
+
+        // Start monitoring this relay. Cancel any existing monitor first —
+        // addRelay is documented to replace, not duplicate.
+        monitorTasks[url]?.cancel()
+        monitorTasks[url] = Task { [weak self] in
+            await self?.monitorRelay(url: url)
         }
-        
+
         return relay
     }
     
@@ -258,12 +264,16 @@ public actor RelayPool {
     /// - Parameter url: The URL of the relay to remove
     public func removeRelay(url: String) async {
         guard let relay = relays[url] else { return }
-        
+
+        // Cancel the monitor task first so it doesn't try to read the relay
+        // after we've removed it.
+        monitorTasks.removeValue(forKey: url)?.cancel()
+
         // Disconnect if connected
         if relay.state == .connected {
             await relay.service.disconnect()
         }
-        
+
         // Clean up any pending OK responses
         if let pendingResponses = pendingOKResponses[url] {
             for (_, continuation) in pendingResponses {
@@ -276,10 +286,10 @@ public actor RelayPool {
             }
             pendingOKResponses.removeValue(forKey: url)
         }
-        
+
         // Remove from pool
         relays.removeValue(forKey: url)
-        
+
         // Clean up subscriptions for this relay
         for subscription in subscriptions.values {
             await subscription.removeRelay(url: url)
@@ -289,43 +299,44 @@ public actor RelayPool {
     /// Connects to a specific relay
     /// - Parameter url: The URL of the relay to connect
     public func connect(to url: String) async throws {
-        guard var relay = relays[url] else {
+        guard let service = relays[url]?.service else {
             throw NostrError.notFound(resource: "Relay with URL \(url)")
         }
-        
-        relay.state = .connecting
-        relays[url] = relay
-        
+
+        mutateRelay(url) { $0.state = .connecting }
+
         do {
-            try await relay.service.connect()
-            
-            relay.state = .connected
-            relay.lastConnectedAt = Date()
-            relay.failureCount = 0
-            relay.lastError = nil
-            relay.healthScore = 1.0
-            relays[url] = relay
-            
+            try await service.connect()
+
+            mutateRelay(url) {
+                $0.state = .connected
+                $0.lastConnectedAt = Date()
+                $0.failureCount = 0
+                $0.lastError = nil
+                $0.healthScore = 1.0
+            }
+
             // Fetch relay information
             await fetchRelayInformation(for: url)
-            
+
             // Notify delegate
             await delegate?.relayPool(self, didConnectTo: url)
-            
+
         } catch {
-            relay.state = .failed
-            relay.lastError = error
-            relay.failureCount += 1
-            relays[url] = relay
-            
+            mutateRelay(url) {
+                $0.state = .failed
+                $0.lastError = error
+                $0.failureCount += 1
+            }
+
             // Update health score
             await updateHealthScore(for: url, eventType: .connectionFailure)
-            
+
             // Schedule reconnection if enabled
             if configuration.autoReconnect {
                 await scheduleReconnection(for: url)
             }
-            
+
             throw error
         }
     }
@@ -344,11 +355,10 @@ public actor RelayPool {
     /// Disconnects from a specific relay
     /// - Parameter url: The URL of the relay to disconnect
     public func disconnect(from url: String) async {
-        guard var relay = relays[url] else { return }
-        
-        await relay.service.disconnect()
-        relay.state = .disconnected
-        relays[url] = relay
+        guard let service = relays[url]?.service else { return }
+
+        await service.disconnect()
+        mutateRelay(url) { $0.state = .disconnected }
         
         // Clean up any pending OK responses
         if let pendingResponses = pendingOKResponses[url] {
@@ -482,7 +492,20 @@ public actor RelayPool {
     }
     
     // MARK: - Private Methods
-    
+
+    /// Mutate the relay record at `url` atomically from within the actor's
+    /// context. Centralizes the read-modify-write on `relays[url]` so callers
+    /// never hold a stale struct copy across an `await` — a re-entrant update
+    /// to the same dict (e.g. stats increments from `monitorRelay`) would
+    /// otherwise be silently overwritten when the stale copy is written back.
+    @discardableResult
+    private func mutateRelay(_ url: String, _ body: (inout Relay) -> Void) -> Relay? {
+        guard var relay = relays[url] else { return nil }
+        body(&relay)
+        relays[url] = relay
+        return relay
+    }
+
     private func publishToRelay(_ event: NostrEvent, relay: Relay) async -> PublishResult {
         let startTime = Date()
         let relayURL = relay.url
@@ -504,10 +527,9 @@ public actor RelayPool {
                 do {
                     try await relay.service.publishEvent(event)
 
-                    if var updatedRelay = relays[relayURL] {
-                        updatedRelay.stats.eventsSent += 1
-                        updatedRelay.stats.lastActivity = Date()
-                        relays[relayURL] = updatedRelay
+                    mutateRelay(relayURL) {
+                        $0.stats.eventsSent += 1
+                        $0.stats.lastActivity = Date()
                     }
 
                     try? await Task.sleep(nanoseconds: 5_000_000_000) // 5s OK timeout
@@ -534,11 +556,12 @@ public actor RelayPool {
         }
 
         // Update response time statistics
-        if result.success, var updatedRelay = relays[relay.url] {
+        if result.success {
             let responseTime = Date().timeIntervalSince(startTime)
-            updatedRelay.stats.averageResponseTime =
-                (updatedRelay.stats.averageResponseTime + responseTime) / 2
-            relays[relay.url] = updatedRelay
+            mutateRelay(relay.url) {
+                $0.stats.averageResponseTime =
+                    ($0.stats.averageResponseTime + responseTime) / 2
+            }
         } else {
             await updateHealthScore(for: relay.url, eventType: .publishFailure)
         }
@@ -547,47 +570,43 @@ public actor RelayPool {
     }
     
     private func monitorRelay(url: String) async {
-        guard let relay = relays[url] else { return }
+        guard let service = relays[url]?.service else { return }
 
-        for await message in relay.service.messages {
-            // Update statistics
-            if var updatedRelay = relays[url] {
-                updatedRelay.stats.lastActivity = Date()
-
-                switch message {
-                case .event(_, let event):
-                    updatedRelay.stats.eventsReceived += 1
-                    // Log NWC response events for debugging
-                    if event.kind == EventKind.nwcResponse.rawValue {
-                        print("[RelayPool] NWC response received - id: \(event.id.prefix(16)), from: \(event.pubkey.prefix(16))...")
-                    }
-                case .notice(let notice):
-                    print("[RelayPool] Notice from \(url): \(notice)")
-                case .ok(let eventId, let accepted, let message):
-                    // Check if we have a pending continuation for this event
-                    if let continuation = pendingOKResponses[url]?[eventId] {
-                        pendingOKResponses[url]?.removeValue(forKey: eventId)
-
-                        // Resume the continuation with the result
-                        continuation.resume(returning: PublishResult(
-                            relay: url,
-                            success: accepted,
-                            message: message,
-                            error: accepted ? nil : RelayError.eventRejected(reason: message)
-                        ))
-                    }
-
-                    if !accepted {
-                        print("[RelayPool] Event rejected by \(url): \(message ?? "No reason")")
-                        await updateHealthScore(for: url, eventType: .eventRejected)
-                    }
-                case .closed(let subscriptionId, let message):
-                    print("[RelayPool] Subscription \(subscriptionId) closed by \(url): \(message ?? "No reason")")
-                default:
-                    break
+        for await message in service.messages {
+            // Stats update is done synchronously via the helper so any
+            // concurrent mutation (e.g. `publishToRelay` bumping `eventsSent`)
+            // isn't overwritten by a stale copy held across an await below.
+            mutateRelay(url) { r in
+                r.stats.lastActivity = Date()
+                if case .event = message {
+                    r.stats.eventsReceived += 1
                 }
+            }
 
-                relays[url] = updatedRelay
+            switch message {
+            case .event(_, let event):
+                if event.kind == EventKind.nwcResponse.rawValue {
+                    poolLogger.debug("NWC response received - id: \(event.id.prefix(16)), from: \(event.pubkey.prefix(16))...")
+                }
+            case .notice(let notice):
+                poolLogger.info("Notice from \(url): \(notice)")
+            case .ok(let eventId, let accepted, let okMessage):
+                if let pending = pendingOKResponses[url]?.removeValue(forKey: eventId) {
+                    pending.resume(returning: PublishResult(
+                        relay: url,
+                        success: accepted,
+                        message: okMessage,
+                        error: accepted ? nil : RelayError.eventRejected(reason: okMessage)
+                    ))
+                }
+                if !accepted {
+                    poolLogger.warning("Event rejected by \(url): \(okMessage ?? "No reason")")
+                    await updateHealthScore(for: url, eventType: .eventRejected)
+                }
+            case .closed(let subscriptionId, let closedMessage):
+                poolLogger.info("Subscription \(subscriptionId) closed by \(url): \(closedMessage ?? "No reason")")
+            default:
+                break
             }
 
             // Forward message to relevant subscriptions
@@ -595,39 +614,31 @@ public actor RelayPool {
                 await subscription.handleMessage(message, from: url)
             }
         }
-        
+
         // Connection dropped
-        if var relay = relays[url] {
-            relay.state = .disconnected
-            relays[url] = relay
-            
-            if configuration.autoReconnect {
-                await scheduleReconnection(for: url)
-            }
+        mutateRelay(url) { $0.state = .disconnected }
+
+        if configuration.autoReconnect {
+            await scheduleReconnection(for: url)
         }
     }
     
     private func scheduleReconnection(for url: String) async {
-        guard var relay = relays[url] else { return }
-        
-        relay.state = .reconnecting
-        relays[url] = relay
-        
+        guard let updated = mutateRelay(url, { $0.state = .reconnecting }) else { return }
+
         let delay = min(
-            configuration.initialReconnectDelay * pow(configuration.backoffMultiplier, Double(relay.failureCount)),
+            configuration.initialReconnectDelay * pow(configuration.backoffMultiplier, Double(updated.failureCount)),
             configuration.maxReconnectDelay
         )
-        
+
         try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-        
+
         if let currentRelay = relays[url], currentRelay.state == .reconnecting {
             try? await connect(to: url)
         }
     }
     
     private func updateHealthScore(for url: String, eventType: HealthEvent) async {
-        guard var relay = relays[url] else { return }
-        
         let impact: Double
         switch eventType {
         case .connectionSuccess:
@@ -647,19 +658,20 @@ public actor RelayPool {
         case .timeout:
             impact = -0.2
         }
-        
-        relay.healthScore = max(0, min(1, relay.healthScore + impact))
-        relays[url] = relay
-        
+
+        guard let updated = mutateRelay(url, {
+            $0.healthScore = max(0, min(1, $0.healthScore + impact))
+        }) else { return }
+
         // Notify delegate if relay became unhealthy
-        if relay.healthScore < configuration.minHealthScore {
-            await delegate?.relayPool(self, relay: url, becameUnhealthyWithScore: relay.healthScore)
+        if updated.healthScore < configuration.minHealthScore {
+            await delegate?.relayPool(self, relay: url, becameUnhealthyWithScore: updated.healthScore)
         }
     }
     
     private func fetchRelayInformation(for url: String) async {
-        guard var relay = relays[url] else { return }
-        
+        guard relays[url] != nil else { return }
+
         // Convert WebSocket URL to HTTP(S) URL
         var httpURL = url
         if httpURL.hasPrefix("wss://") {
@@ -667,42 +679,42 @@ public actor RelayPool {
         } else if httpURL.hasPrefix("ws://") {
             httpURL = httpURL.replacingOccurrences(of: "ws://", with: "http://")
         }
-        
+
         // Ensure URL has trailing slash
         if !httpURL.hasSuffix("/") {
             httpURL += "/"
         }
-        
+
         guard let infoURL = URL(string: httpURL) else { return }
-        
+
         do {
             // Create request with Accept header for NIP-11
             var request = URLRequest(url: infoURL)
             request.setValue("application/nostr+json", forHTTPHeaderField: "Accept")
             request.timeoutInterval = 10.0
-            
+
             let (data, response) = try await URLSession.shared.data(for: request)
-            
+
             // Check response
             guard let httpResponse = response as? HTTPURLResponse,
                   httpResponse.statusCode == 200 else {
-                print("[RelayPool] Failed to fetch relay information from \(url)")
+                relayLogger.warning("Failed to fetch relay information from \(url)")
                 return
             }
-            
+
             // Decode relay information
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             let relayInfo = try decoder.decode(RelayInformation.self, from: data)
-            
-            // Update relay with information
-            relay.info = relayInfo
-            relays[url] = relay
-            
-            print("[RelayPool] Fetched relay information for \(url): \(relayInfo.name ?? "Unknown")")
-            
+
+            // Write back through the helper — not through a stale `var` held
+            // across the `URLSession` await above.
+            mutateRelay(url) { $0.info = relayInfo }
+
+            relayLogger.debug("Fetched relay information for \(url): \(relayInfo.name ?? "Unknown")")
+
         } catch {
-            print("[RelayPool] Error fetching relay information from \(url): \(error)")
+            relayLogger.error("Error fetching relay information from \(url)", error: error)
         }
     }
     
@@ -751,7 +763,7 @@ public actor PoolSubscription {
                 try await relay.service.subscribe(id: id, filters: filters)
                 relaySubscriptions[url] = false
             } catch {
-                print("[PoolSubscription] Failed to subscribe to \(url): \(error)")
+                subscriptionLogger.warning("Failed to subscribe to \(url): \(error)")
             }
         }
     }
@@ -765,7 +777,7 @@ public actor PoolSubscription {
                     seenEventIds.insert(event.id)
                     // Log NWC response events for debugging
                     if event.kind == EventKind.nwcResponse.rawValue {
-                        print("[PoolSubscription] Yielding NWC response - subId: \(id.prefix(8)), eventId: \(event.id.prefix(16))")
+                        subscriptionLogger.debug("Yielding NWC response - subId: \(id.prefix(8)), eventId: \(event.id.prefix(16))")
                     }
                     eventSubject.continuation.yield(event)
                 }
