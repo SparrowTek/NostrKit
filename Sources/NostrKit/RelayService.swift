@@ -13,63 +13,63 @@ public typealias WebSocketStream = AsyncThrowingStream<URLSessionWebSocketTask.M
 /// allowing you to use async/await patterns to handle incoming messages.
 /// It automatically manages the WebSocket task lifecycle and message reception.
 ///
-/// - Note: This class is marked as @unchecked Sendable because URLSessionWebSocketTask
-///         is not Sendable, but we ensure thread-safe access internally.
-class SocketStream: AsyncSequence, @unchecked Sendable {
+/// All stored properties are immutable after `init`. The continuation is
+/// assigned exactly once via `AsyncStream`'s synchronous init closure, so the
+/// type is genuinely thread-safe without any `@unchecked Sendable` escape
+/// hatch — the receive loop runs on URLSession's delegate queue and only
+/// touches `Sendable` state (`continuation` and `task`).
+final class SocketStream: AsyncSequence, Sendable {
     typealias AsyncIterator = WebSocketStream.Iterator
     typealias Element = URLSessionWebSocketTask.Message
 
-    private var continuation: WebSocketStream.Continuation?
+    private let stream: WebSocketStream
+    private let continuation: WebSocketStream.Continuation
     private let task: URLSessionWebSocketTask
-    
-    private lazy var stream: WebSocketStream = {
-        return WebSocketStream { continuation in
-            self.continuation = continuation
-            Task {
-                self.waitForNextValue()
-            }
-        }
-    }()
-
-    private func waitForNextValue() {
-        guard task.closeCode == .invalid else {
-            continuation?.finish()
-            return
-        }
-        
-        task.receive { [weak self] result in
-            guard let self, let continuation else { return }
-            
-            do {
-                let message = try result.get()
-                continuation.yield(message)
-                waitForNextValue()
-            } catch {
-                continuation.finish(throwing: error)
-            }
-        }
-    }
 
     init(task: URLSessionWebSocketTask) {
+        // AsyncStream's build closure runs synchronously during this call,
+        // so the IUO is guaranteed to be assigned before we read it.
+        var cont: WebSocketStream.Continuation!
+        self.stream = WebSocketStream { cont = $0 }
+        self.continuation = cont
         self.task = task
         task.resume()
+        receiveNext()
     }
 
     deinit {
-        continuation?.finish()
+        continuation.finish()
     }
 
     func makeAsyncIterator() -> AsyncIterator {
         return stream.makeAsyncIterator()
     }
-    
+
     func send(_ message: URLSessionWebSocketTask.Message) async throws {
         try await task.send(message)
     }
 
     func cancel() async throws {
         task.cancel(with: .goingAway, reason: nil)
-        continuation?.finish()
+        continuation.finish()
+    }
+
+    private func receiveNext() {
+        guard task.closeCode == .invalid else {
+            continuation.finish()
+            return
+        }
+
+        task.receive { [weak self] result in
+            guard let self else { return }
+            do {
+                let message = try result.get()
+                self.continuation.yield(message)
+                self.receiveNext()
+            } catch {
+                self.continuation.finish(throwing: error)
+            }
+        }
     }
 }
 
