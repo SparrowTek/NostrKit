@@ -37,10 +37,14 @@ public class NostrEventStream {
         self.deduplicationWindow = deduplicationWindow
     }
     
-    deinit {
-//        for task in eventTasks.values {
-//            task.cancel()
-//        }
+    // Isolated deinit runs on MainActor (SE-0371), so it can read the
+    // MainActor-isolated `eventTasks`. Cancelling the tasks stops their
+    // `for await event in subscription.events` loops and lets the pool
+    // subscriptions be released.
+    isolated deinit {
+        for task in eventTasks.values {
+            task.cancel()
+        }
     }
     
     // MARK: - Public Methods
