@@ -5,11 +5,15 @@ import PackageDescription
 let package = Package(
     name: "NostrKit",
     platforms: [
-        .macOS(.v26),
-        .iOS(.v26),
-        .tvOS(.v26),
-        .watchOS(.v26),
-        .macCatalyst(.v26)
+        // Floor is iOS 18 / macOS 15 / tvOS 18 / watchOS 11 — what's needed
+        // for Swift 6.2 language features used here (isolated deinit from
+        // SE-0371, Sendable URLSession tasks, @Observable MainActor classes).
+        // Widens reach vs. requiring the current OS major.
+        .macOS(.v15),
+        .iOS(.v18),
+        .tvOS(.v18),
+        .watchOS(.v11),
+        .macCatalyst(.v18)
     ],
     products: [
         .library(

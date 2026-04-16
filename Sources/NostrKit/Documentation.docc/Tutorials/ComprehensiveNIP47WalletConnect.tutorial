@@ -116,15 +116,18 @@
                     import SwiftUI
                     import NostrKit
                     import CoreNostr
-                    
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.lightningapp", category: "App")
+
                     @main
                     struct LightningApp: App {
                         // Create wallet manager as StateObject
                         @StateObject private var walletManager = WalletConnectManager()
-                        
+
                         // Create key manager for Nostr identity
                         @StateObject private var keyManager = KeyManager()
-                        
+
                         var body: some Scene {
                             WindowGroup {
                                 ContentView()
@@ -136,21 +139,25 @@
                                     }
                             }
                         }
-                        
+
                         func initializeApp() async {
                             // Load or generate Nostr keys
                             do {
                                 try await keyManager.loadOrGenerateKeys()
-                                
-                                // Set up wallet manager with keys
-                                await walletManager.initialize(
-                                    keyPair: keyManager.keyPair!
-                                )
-                                
+
+                                // Set up wallet manager with keys — keyPair is
+                                // non-nil after a successful load/generate, but
+                                // we guard rather than force unwrap.
+                                guard let keyPair = keyManager.keyPair else {
+                                    logger.error("Key manager returned no key pair after load/generate")
+                                    return
+                                }
+                                await walletManager.initialize(keyPair: keyPair)
+
                                 // Restore previous connections
                                 await walletManager.restoreConnections()
                             } catch {
-                                print("Initialization failed: \(error)")
+                                logger.error("Initialization failed: \(error.localizedDescription)")
                             }
                         }
                     }
@@ -163,34 +170,37 @@
                 @Code(name: "KeyManager.swift", file: nip47-04-keys.swift) {
                     import NostrKit
                     import CoreNostr
-                    
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.lightningapp", category: "KeyManager")
+
                     @MainActor
                     class KeyManager: ObservableObject {
                         @Published var keyPair: KeyPair?
                         @Published var npub: String = ""
-                        
+
                         private let keyStore = SecureKeyStore()
                         private let keyIdentifier = "main-nostr-identity"
-                        
+
                         func loadOrGenerateKeys() async throws {
                             // Try to load existing keys
                             if let stored = try? keyStore.load(identifier: keyIdentifier) {
                                 self.keyPair = stored
                                 self.npub = stored.npub
-                                print("Loaded existing identity: \(npub)")
+                                logger.info("Loaded existing identity: \(stored.npub, privacy: .public)")
                             } else {
                                 // Generate new key pair
                                 let newKeyPair = try KeyPair()
-                                
+
                                 // Store securely in keychain
                                 try keyStore.store(
                                     keyPair: newKeyPair,
                                     identifier: keyIdentifier
                                 )
-                                
+
                                 self.keyPair = newKeyPair
                                 self.npub = newKeyPair.npub
-                                print("Generated new identity: \(npub)")
+                                logger.info("Generated new identity: \(newKeyPair.npub, privacy: .public)")
                             }
                         }
                         
@@ -209,7 +219,10 @@
                 @Code(name: "WalletConnectManager+Persistence.swift", file: nip47-05-persistence.swift) {
                     import Foundation
                     import NostrKit
-                    
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.lightningapp", category: "Persistence")
+
                     extension WalletConnectManager {
                         private var connectionsKey: String { "nwc_connections" }
                         
@@ -247,9 +260,9 @@
                             for uri in savedURIs {
                                 do {
                                     try await connect(uri: uri)
-                                    print("Restored connection: \(uri.prefix(50))...")
+                                    logger.info("Restored connection: \(uri.prefix(50), privacy: .private(mask: .hash))…")
                                 } catch {
-                                    print("Failed to restore connection: \(error)")
+                                    logger.error("Failed to restore connection: \(error.localizedDescription)")
                                 }
                             }
                         }
@@ -482,14 +495,14 @@
                             }
                         }
                         
-                        var connectionURL: URL {
+                        var connectionURL: URL? {
                             switch self {
-                            case .alby: 
-                                return URL(string: "https://getalby.com/nwc")!
-                            case .mutiny: 
-                                return URL(string: "https://app.mutinywallet.com/settings/connections")!
+                            case .alby:
+                                return URL(string: "https://getalby.com/nwc")
+                            case .mutiny:
+                                return URL(string: "https://app.mutinywallet.com/settings/connections")
                             case .lifpay:
-                                return URL(string: "https://lifpay.me/developer")!
+                                return URL(string: "https://lifpay.me/developer")
                             }
                         }
                     }
@@ -606,9 +619,9 @@
                                 Spacer()
                                 
                                 // Balance preview (if available)
-                                if connection.lastBalance != nil {
+                                if let balance = connection.lastBalance {
                                     VStack(alignment: .trailing) {
-                                        Text("\(connection.lastBalance!) sats")
+                                        Text("\(balance) sats")
                                             .font(.headline)
                                         Text("Balance")
                                             .font(.caption)
@@ -1237,7 +1250,10 @@
                 @Code(name: "NWCErrorHandling.swift", file: nip47-10-errors.swift) {
                     import SwiftUI
                     import NostrKit
-                    
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.lightningapp", category: "ErrorRecovery")
+
                     // Enhanced error types for NWC operations
                     enum NWCOperationError: LocalizedError {
                         case connectionLost
@@ -1367,20 +1383,20 @@
                                 try await walletManager.reconnect()
                                 recoveryProgress = 0.6
                             } catch {
-                                print("Relay reconnection failed: \(error)")
+                                logger.error("Relay reconnection failed: \(error.localizedDescription)")
                                 return
                             }
-                            
+
                             // Progress: 60-100% - Verify wallet connection
                             recoveryProgress = 0.8
-                            
+
                             // Test with get_info request
                             do {
                                 _ = try await walletManager.getWalletInfo()
                                 recoveryProgress = 1.0
                                 currentError = nil // Clear error on success
                             } catch {
-                                print("Wallet verification failed: \(error)")
+                                logger.error("Wallet verification failed: \(error.localizedDescription)")
                             }
                         }
                         
@@ -1424,12 +1440,15 @@
                         }
                         
                         private func checkNetworkConnectivity() async -> Bool {
-                            // Check network reachability
-                            let url = URL(string: "https://google.com")!
+                            // Check network reachability — guard rather than
+                            // force-unwrap the URL literal.
+                            guard let url = URL(string: "https://google.com") else {
+                                return false
+                            }
                             var request = URLRequest(url: url)
                             request.httpMethod = "HEAD"
                             request.timeoutInterval = 5
-                            
+
                             do {
                                 let (_, response) = try await URLSession.shared.data(for: request)
                                 return (response as? HTTPURLResponse)?.statusCode == 200
@@ -1554,6 +1573,9 @@
                     import Security
                     import CryptoKit
                     import NostrKit
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.lightningapp", category: "Audit")
                     
                     // Secure storage for NWC connections
                     actor SecureNWCStorage {
@@ -1576,13 +1598,21 @@
                             
                             let jsonData = try JSONEncoder().encode(sensitiveData)
                             let sealedBox = try AES.GCM.seal(jsonData, using: encryptionKey)
-                            
+
+                            // `combined` packs nonce + ciphertext + tag into a
+                            // single buffer and is only nil if the nonce is
+                            // larger than 12 bytes, which AES.GCM.seal never
+                            // produces — we still guard rather than force.
+                            guard let sealedData = sealedBox.combined else {
+                                throw KeychainError.storeFailed(errSecParam)
+                            }
+
                             // Store in keychain
                             let query: [String: Any] = [
                                 kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrService as String: keychainService,
                                 kSecAttrAccount as String: connection.id,
-                                kSecValueData as String: sealedBox.combined!,
+                                kSecValueData as String: sealedData,
                                 kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
                             ]
                             
@@ -1806,13 +1836,13 @@
                                     let handle = try FileHandle(forWritingTo: logFileURL)
                                     try handle.seekToEnd()
                                     handle.write(data)
-                                    handle.write("\n".data(using: .utf8)!)
+                                    handle.write(Data("\n".utf8))
                                     try handle.close()
                                 } else {
                                     try data.write(to: logFileURL)
                                 }
                             } catch {
-                                print("Audit log failed: \(error)")
+                                logger.error("Audit log failed: \(error.localizedDescription)")
                             }
                         }
                         

@@ -160,7 +160,15 @@ actor KeychainWrapper {
         return status == errSecSuccess
     }
     
-    /// Lists all keys for this service
+    /// Lists all keychain item account names registered under this wrapper's
+    /// service identifier.
+    ///
+    /// Returns an empty array if no items exist or if the query fails. Callers
+    /// typically prefix-filter the result (e.g., `hasPrefix("identity.")`) to
+    /// enumerate keys they own.
+    ///
+    /// - Returns: Account strings for every `kSecClassGenericPassword` item
+    ///   whose `kSecAttrService` equals this wrapper's `service`
     func allKeys() -> [String] {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

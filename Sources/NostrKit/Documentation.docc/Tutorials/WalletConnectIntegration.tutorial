@@ -339,6 +339,10 @@
                 Create a balance display component.
                 
                 @Code(name: "BalanceView.swift", file: wallet-07-balance.swift) {
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.lightningapp", category: "Balance")
+
                     struct BalanceView: View {
                         @EnvironmentObject var walletManager: WalletConnectManager
                         @State private var balance: Int64?
@@ -390,7 +394,7 @@
                             do {
                                 balance = try await walletManager.getBalance()
                             } catch {
-                                print("Failed to fetch balance: \(error)")
+                                logger.error("Failed to fetch balance: \(error.localizedDescription)")
                             }
                         }
                     }

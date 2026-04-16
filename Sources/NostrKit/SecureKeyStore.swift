@@ -309,13 +309,30 @@ public actor SecureKeyStore {
     }
     
     // MARK: - Key Derivation
-    
-    /// Derives a new identity from an existing one
+
+    /// Derives a new identity from an existing one using HMAC-SHA256 over the
+    /// parent private key and the path string.
+    ///
+    /// - Note: This is a *simplified* derivation — it is **not** BIP32. It
+    ///   produces a deterministic child key from `(parentPrivateKey, path)`
+    ///   without a chain code, so it can't reconstruct a parent from a child
+    ///   (which is a feature, not a bug) but it also doesn't interoperate with
+    ///   external BIP32 / NIP-06 tooling. For NIP-06-compatible derivation
+    ///   from a mnemonic, use `NIP06.deriveKeyPair(from:passphrase:account:)`
+    ///   in CoreNostr.
+    ///
+    /// The parent identity must have `canDerive: true` in its permissions. The
+    /// child identity ID is `"\(parentIdentity):\(path)"`, so paths must be
+    /// unique under a given parent.
+    ///
     /// - Parameters:
     ///   - parentIdentity: The parent identity to derive from
-    ///   - path: The derivation path component
-    ///   - name: Name for the new identity
-    /// - Returns: The identity ID of the derived key
+    ///   - path: The derivation path component (e.g., `"work"`, `"gaming/alt"`)
+    ///   - name: Display name for the new identity
+    /// - Returns: The identity ID of the derived key (for use with
+    ///   ``retrieve(identity:authenticationRequired:)``)
+    /// - Throws: ``KeyStoreError/permissionDenied(_:)`` if derivation is
+    ///   disallowed, or keychain errors on store failure
     @discardableResult
     public func deriveIdentity(
         from parentIdentity: String,

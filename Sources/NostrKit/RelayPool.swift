@@ -638,6 +638,25 @@ public actor RelayPool {
         }
     }
     
+    /// Adjusts a relay's `healthScore` (0.0–1.0) by a per-event-type delta and
+    /// notifies the delegate if the score crosses the unhealthy threshold.
+    ///
+    /// The weights are tuned so that a single connection failure (−0.3)
+    /// dominates several successes (+0.05 each), which pushes chronically
+    /// flaky relays below `configuration.minHealthScore` quickly while
+    /// transient blips recover within a few successful operations. The score
+    /// is clamped to `[0, 1]` on each update.
+    ///
+    /// | Event                | Impact |
+    /// |----------------------|--------|
+    /// | connectionSuccess    | +0.10  |
+    /// | connectionFailure    | −0.30  |
+    /// | publishSuccess       | +0.05  |
+    /// | publishFailure       | −0.10  |
+    /// | subscriptionSuccess  | +0.05  |
+    /// | subscriptionFailure  | −0.10  |
+    /// | eventRejected        | −0.05  |
+    /// | timeout              | −0.20  |
     private func updateHealthScore(for url: String, eventType: HealthEvent) async {
         let impact: Double
         switch eventType {

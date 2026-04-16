@@ -72,23 +72,27 @@
                 @Code(name: "KeyManager.swift", file: keys-01-generate.swift) {
                     import NostrKit
                     import CoreNostr
-                    
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.nostrtutorial", category: "KeyManager")
+
                     class KeyManager {
                         private var keyPair: KeyPair?
-                        
+
                         func generateNewIdentity() throws {
                             // Generate a new key pair
-                            keyPair = try KeyPair()
-                            
+                            let newKeyPair = try KeyPair()
+                            self.keyPair = newKeyPair
+
                             // Get the keys in different formats
-                            let privateKeyHex = keyPair?.privateKey
-                            let publicKeyHex = keyPair?.publicKey
-                            
+                            let privateKeyHex = newKeyPair.privateKey
+                            let publicKeyHex = newKeyPair.publicKey
+
                             // Bech32-encoded versions (human-readable)
-                            let nsec = keyPair?.nsec  // Private key (starts with "nsec1")
-                            let npub = keyPair?.npub  // Public key (starts with "npub1")
-                            
-                            print("Your public key (npub): \(npub ?? "")")
+                            let nsec = newKeyPair.nsec  // Private key (starts with "nsec1")
+                            let npub = newKeyPair.npub  // Public key (starts with "npub1")
+
+                            logger.info("Your public key (npub): \(npub, privacy: .public)")
                         }
                     }
                 }
@@ -100,22 +104,24 @@
                 @Code(name: "KeyManager.swift", file: keys-02-store.swift) {
                     import NostrKit
                     import CoreNostr
-                    
+
                     class KeyManager {
                         private let keyStore = SecureKeyStore()
                         private var keyPair: KeyPair?
-                        
+
                         func generateAndStore() throws {
                             // Generate new key pair
-                            keyPair = try KeyPair()
-                            
+                            let newKeyPair = try KeyPair()
+
                             // Store securely in keychain
                             try keyStore.store(
-                                keyPair: keyPair!,
+                                keyPair: newKeyPair,
                                 identifier: "main-identity"
                             )
+
+                            self.keyPair = newKeyPair
                         }
-                        
+
                         func loadStoredKey() throws {
                             // Load from keychain
                             keyPair = try keyStore.load(identifier: "main-identity")
@@ -142,31 +148,34 @@
                 @Code(name: "NostrManager.swift", file: relays-01-setup.swift) {
                     import NostrKit
                     import CoreNostr
-                    
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.nostrtutorial", category: "RelayPool")
+
                     @MainActor
                     class NostrManager: ObservableObject {
                         let relayPool = RelayPool()
                         private let keyPair: KeyPair
-                        
+
                         init() throws {
                             self.keyPair = try KeyPair()
-                            
+
                             Task {
                                 await setupRelays()
                             }
                         }
-                        
+
                         func setupRelays() async {
                             do {
                                 // Add popular public relays
                                 try await relayPool.addRelay(url: "wss://relay.damus.io")
                                 try await relayPool.addRelay(url: "wss://relay.nostr.band")
                                 try await relayPool.addRelay(url: "wss://nos.lol")
-                                
+
                                 // Connect to all relays
                                 await relayPool.connectAll()
                             } catch {
-                                print("Failed to set up relays: \(error)")
+                                logger.error("Failed to set up relays: \(error.localizedDescription)")
                             }
                         }
                     }
@@ -213,6 +222,10 @@
                 Create and sign a text note event.
                 
                 @Code(name: "NostrManager.swift", file: publish-01-create.swift) {
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.nostrtutorial", category: "Publishing")
+
                     func publishTextNote(content: String) async throws {
                         // Create a text note event (kind 1)
                         let event = try NostrEvent(
@@ -222,19 +235,19 @@
                             tags: [],
                             content: content
                         )
-                        
+
                         // Sign the event with your private key
                         let signedEvent = try keyPair.signEvent(event)
-                        
+
                         // Publish to all connected relays
                         let results = await relayPool.publish(signedEvent)
-                        
+
                         // Check results
                         for result in results {
                             if result.success {
-                                print("Published to \(result.relay)")
+                                logger.info("Published to \(result.relay, privacy: .public)")
                             } else if let error = result.error {
-                                print("Failed to publish to \(result.relay): \(error)")
+                                logger.error("Failed to publish to \(result.relay, privacy: .public): \(error.localizedDescription)")
                             }
                         }
                     }
@@ -245,6 +258,10 @@
                 Add a simple UI for composing and publishing notes.
                 
                 @Code(name: "ComposeView.swift", file: publish-02-ui.swift) {
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.nostrtutorial", category: "Compose")
+
                     struct ComposeView: View {
                         @EnvironmentObject var nostrManager: NostrManager
                         @State private var noteContent = ""
@@ -279,15 +296,15 @@
                         
                         func publishNote() {
                             isPublishing = true
-                            
+
                             Task {
                                 do {
                                     try await nostrManager.publishTextNote(content: noteContent)
                                     noteContent = ""
                                 } catch {
-                                    print("Failed to publish: \(error)")
+                                    logger.error("Failed to publish: \(error.localizedDescription)")
                                 }
-                                
+
                                 isPublishing = false
                             }
                         }
@@ -349,6 +366,10 @@
                 Create a feed view to display events.
                 
                 @Code(name: "FeedView.swift", file: subscribe-02-feed.swift) {
+                    import OSLog
+
+                    private let logger = Logger(subsystem: "com.example.nostrtutorial", category: "Feed")
+
                     struct FeedView: View {
                         @EnvironmentObject var nostrManager: NostrManager
                         
@@ -365,7 +386,7 @@
                                 do {
                                     try await nostrManager.subscribeToGlobalFeed()
                                 } catch {
-                                    print("Failed to subscribe: \(error)")
+                                    logger.error("Failed to subscribe: \(error.localizedDescription)")
                                 }
                             }
                         }
