@@ -485,70 +485,64 @@ public actor RelayPool {
     
     private func publishToRelay(_ event: NostrEvent, relay: Relay) async -> PublishResult {
         let startTime = Date()
-        
-        // Set up continuation for OK response
-        let result = await withCheckedContinuation { continuation in
-                // Store the continuation
-                if pendingOKResponses[relay.url] == nil {
-                    pendingOKResponses[relay.url] = [:]
-                }
-                pendingOKResponses[relay.url]?[event.id] = continuation
-                
-                // Send the event and handle timeout
-                Task {
-                    do {
-                        try await relay.service.publishEvent(event)
-                        
-                        // Update statistics for sent event
-                        if var updatedRelay = relays[relay.url] {
-                            updatedRelay.stats.eventsSent += 1
-                            updatedRelay.stats.lastActivity = Date()
-                            relays[relay.url] = updatedRelay
-                        }
-                        
-                        // Set a timeout for OK response
-                        Task {
-                            try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 second timeout
-                            
-                            // Check if continuation is still pending
-                            if let pending = pendingOKResponses[relay.url]?[event.id] {
-                                pendingOKResponses[relay.url]?.removeValue(forKey: event.id)
-                                
-                                // Timeout occurred
-                                pending.resume(returning: PublishResult(
-                                    relay: relay.url,
-                                    success: false,
-                                    message: "Timeout waiting for OK response",
-                                    error: RelayError.timeout
-                                ))
-                            }
-                        }
-                        
-                    } catch {
-                        // Remove pending continuation
-                        pendingOKResponses[relay.url]?.removeValue(forKey: event.id)
-                        
-                        // Resume with error
-                        continuation.resume(returning: PublishResult(
-                            relay: relay.url,
+        let relayURL = relay.url
+        let eventId = event.id
+
+        // Three paths can resume the continuation: the OK handler in `monitorRelay`,
+        // the 5s timeout below, and the publish-failure branch. Because `publishEvent`
+        // is an `await` on this actor, the OK handler can run (and remove+resume the
+        // continuation) during that suspension. Every resume path must therefore claim
+        // the continuation atomically via `removeValue(forKey:)`; whoever wins resumes
+        // exactly once and everyone else becomes a no-op.
+        let result = await withCheckedContinuation { (continuation: CheckedContinuation<PublishResult, Never>) in
+            if pendingOKResponses[relayURL] == nil {
+                pendingOKResponses[relayURL] = [:]
+            }
+            pendingOKResponses[relayURL]?[eventId] = continuation
+
+            Task {
+                do {
+                    try await relay.service.publishEvent(event)
+
+                    if var updatedRelay = relays[relayURL] {
+                        updatedRelay.stats.eventsSent += 1
+                        updatedRelay.stats.lastActivity = Date()
+                        relays[relayURL] = updatedRelay
+                    }
+
+                    try? await Task.sleep(nanoseconds: 5_000_000_000) // 5s OK timeout
+
+                    if let pending = pendingOKResponses[relayURL]?.removeValue(forKey: eventId) {
+                        pending.resume(returning: PublishResult(
+                            relay: relayURL,
+                            success: false,
+                            message: "Timeout waiting for OK response",
+                            error: RelayError.timeout
+                        ))
+                    }
+                } catch {
+                    if let pending = pendingOKResponses[relayURL]?.removeValue(forKey: eventId) {
+                        pending.resume(returning: PublishResult(
+                            relay: relayURL,
                             success: false,
                             message: nil,
                             error: error
                         ))
                     }
                 }
+            }
         }
-        
+
         // Update response time statistics
         if result.success, var updatedRelay = relays[relay.url] {
             let responseTime = Date().timeIntervalSince(startTime)
-            updatedRelay.stats.averageResponseTime = 
+            updatedRelay.stats.averageResponseTime =
                 (updatedRelay.stats.averageResponseTime + responseTime) / 2
             relays[relay.url] = updatedRelay
         } else {
             await updateHealthScore(for: relay.url, eventType: .publishFailure)
         }
-        
+
         return result
     }
     
