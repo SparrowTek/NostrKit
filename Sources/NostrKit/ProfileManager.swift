@@ -543,9 +543,21 @@ public actor ProfileManager {
         
         let name = String(parts[0])
         let domain = String(parts[1])
-        
-        // Build URL
-        let url = URL(string: "https://\(domain)/.well-known/nostr.json?name=\(name)")!
+
+        // Build URL — use URLComponents so the `name` query value is correctly
+        // percent-encoded and an invalid domain produces a clean error.
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = domain
+        components.path = "/.well-known/nostr.json"
+        components.queryItems = [URLQueryItem(name: "name", value: name)]
+
+        guard let url = components.url else {
+            throw NostrError.validationError(
+                field: "identifier",
+                reason: "Invalid NIP-05 domain or name"
+            )
+        }
         
         // Fetch JSON
         let (data, _) = try await URLSession.shared.data(from: url)
@@ -863,7 +875,7 @@ public actor ProfileManager {
                 }
                 
                 let jsonData = try JSONSerialization.data(withJSONObject: tags)
-                let jsonString = String(data: jsonData, encoding: .utf8)!
+                let jsonString = String(decoding: jsonData, as: UTF8.self)
                 
                 let sharedSecret = try keyPair.getSharedSecret(with: keyPair.publicKey)
                 content = try NostrCrypto.encryptMessage(jsonString, with: sharedSecret)

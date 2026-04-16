@@ -233,7 +233,7 @@ public actor SecureKeyStore {
         // Check permissions
         let permissions = try await getPermissions(for: identity)
         
-        if permissions.expiresAt != nil && permissions.expiresAt! < Date() {
+        if let expiresAt = permissions.expiresAt, expiresAt < Date() {
             throw KeyStoreError.permissionDenied("Key access has expired")
         }
         
@@ -480,24 +480,29 @@ public actor SecureKeyStore {
             }
             
             // Decrypt private key
-            let salt = Data(base64Encoded: backupIdentity.salt)!
+            guard let salt = Data(base64Encoded: backupIdentity.salt),
+                  let encryptedData = Data(base64Encoded: backupIdentity.encryptedPrivateKey) else {
+                throw KeyStoreError.backupCorrupted
+            }
+
             let keyData = try deriveKey(
                 from: password,
                 salt: salt,
                 iterations: backupIdentity.iterations
             )
-            
-            let encryptedData = Data(base64Encoded: backupIdentity.encryptedPrivateKey)!
+
             let iv = encryptedData.prefix(16)
             let ciphertext = encryptedData.dropFirst(16)
-            
+
             let decrypted = try NostrCrypto.aesDecrypt(
                 ciphertext: ciphertext,
                 key: keyData,
                 iv: iv
             )
-            
-            let privateKeyHex = String(data: decrypted, encoding: .utf8)!
+
+            guard let privateKeyHex = String(data: decrypted, encoding: .utf8) else {
+                throw KeyStoreError.backupCorrupted
+            }
             let keyPair = try KeyPair(privateKey: privateKeyHex)
             
             // Restore identity

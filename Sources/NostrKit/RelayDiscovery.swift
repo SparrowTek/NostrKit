@@ -232,17 +232,15 @@ public actor RelayDiscovery {
                         discoveredAt: Date(),
                         recommendedBy: Array(relayRecommendations[relay.url] ?? [])
                     )
-                } else {
+                } else if let existing = allDiscoveredRelays[relay.url] {
                     // Update recommendations
-                    var existingRelay = allDiscoveredRelays[relay.url]!
-                    existingRelay = DiscoveredRelay(
-                        url: existingRelay.url,
-                        source: existingRelay.source,
-                        metadata: existingRelay.metadata,
-                        discoveredAt: existingRelay.discoveredAt,
+                    allDiscoveredRelays[relay.url] = DiscoveredRelay(
+                        url: existing.url,
+                        source: existing.source,
+                        metadata: existing.metadata,
+                        discoveredAt: existing.discoveredAt,
                         recommendedBy: Array(relayRecommendations[relay.url] ?? [])
                     )
-                    allDiscoveredRelays[relay.url] = existingRelay
                 }
             }
         }

@@ -1,22 +1,13 @@
 {
-  "originHash" : "daaf9f2814788b64caff87108f818a0d7fd080918db8a768cd19cdf4d3fe2188",
+  "originHash" : "205809fb47ff3eaa96cd588752c5ce469125697b300bfb58b027b6ad6772ebc1",
   "pins" : [
-    {
-      "identity" : "corenostr",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/SparrowTek/CoreNostr.git",
-      "state" : {
-        "revision" : "ec638c2b9a4d6475f0405e4f325d85b03352be7b",
-        "version" : "2.0.1"
-      }
-    },
     {
       "identity" : "swift-asn1",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-asn1.git",
       "state" : {
-        "revision" : "9f542610331815e29cc3821d3b6f488db8715517",
-        "version" : "1.6.0"
+        "revision" : "eb50cbd14606a9161cbc5d452f18797c90ef0bab",
+        "version" : "1.7.0"
       }
     },
     {

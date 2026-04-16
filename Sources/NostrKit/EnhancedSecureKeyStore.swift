@@ -186,16 +186,19 @@ public actor EnhancedSecureKeyStore {
             throw KeyStoreError.secureEnclaveNotAvailable
         }
         
-        let tag = "com.nostrkit.se.\(identity)".data(using: .utf8)!
-        
+        let tagString = "com.nostrkit.se.\(identity)"
+        let tag = Data(tagString.utf8)
+
         // Access control with biometric authentication
-        let access = SecAccessControlCreateWithFlags(
+        guard let access = SecAccessControlCreateWithFlags(
             nil,
             kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             [.privateKeyUsage, .biometryCurrentSet],
             nil
-        )!
-        
+        ) else {
+            throw KeyStoreError.keyGenerationFailed
+        }
+
         // Key generation attributes
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
@@ -224,7 +227,7 @@ public actor EnhancedSecureKeyStore {
         secureEnclaveKeys[identity] = SecureEnclaveKey(
             privateKey: privateKey,
             publicKey: publicKey,
-            tag: String(data: tag, encoding: .utf8)!
+            tag: tagString
         )
         
         // Convert to Nostr format (this is a placeholder - actual conversion needed)
@@ -279,9 +282,9 @@ public actor EnhancedSecureKeyStore {
         biometrics: BiometricOptions?
     ) async throws {
         
-        let privateKeyData = keyPair.privateKey.data(using: .utf8)!
-        let publicKeyData = keyPair.publicKey.data(using: .utf8)!
-        
+        let privateKeyData = Data(keyPair.privateKey.utf8)
+        let publicKeyData = Data(keyPair.publicKey.utf8)
+
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: "private.\(identity)",
@@ -289,16 +292,18 @@ public actor EnhancedSecureKeyStore {
             kSecValueData as String: privateKeyData,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         ]
-        
+
         // Add biometric protection if required
         if let biometrics = biometrics, biometrics.required {
-            let access = SecAccessControlCreateWithFlags(
+            guard let access = SecAccessControlCreateWithFlags(
                 nil,
                 kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
                 biometrics.fallbackToPasscode ? [.biometryCurrentSet, .or, .devicePasscode] : [.biometryCurrentSet],
                 nil
-            )!
-            
+            ) else {
+                throw KeyStoreError.keyGenerationFailed
+            }
+
             query[kSecAttrAccessControl as String] = access
             
             // Add authentication context
@@ -320,8 +325,8 @@ public actor EnhancedSecureKeyStore {
         _ keyPair: KeyPair,
         identity: String
     ) async throws {
-        
-        let privateKeyData = keyPair.privateKey.data(using: .utf8)!
+
+        let privateKeyData = Data(keyPair.privateKey.utf8)
         
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -452,31 +457,38 @@ public actor EnhancedSecureKeyStore {
     private func retrieveFromSecureEnclave(identity: String) async throws -> KeyPair {
         if secureEnclaveKeys[identity] == nil {
             // Try to load from keychain tag
-            let tag = "com.nostrkit.se.\(identity)".data(using: .utf8)!
-            
+            let tagString = "com.nostrkit.se.\(identity)"
+            let tag = Data(tagString.utf8)
+
             let query: [String: Any] = [
                 kSecClass as String: kSecClassKey,
                 kSecAttrApplicationTag as String: tag,
                 kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
                 kSecReturnRef as String: true
             ]
-            
+
             var result: CFTypeRef?
             let status = SecItemCopyMatching(query as CFDictionary, &result)
-            
-            guard status == errSecSuccess,
-                  let privateKey = result as! SecKey? else {
+
+            guard status == errSecSuccess, let cfResult = result else {
                 throw KeyStoreError.identityNotFound(identity)
             }
-            
+            // SecItemCopyMatching returns an untyped CFTypeRef. Verify it's a
+            // SecKey via CFTypeID before using it, so a type mismatch becomes a
+            // clean error instead of a runtime trap.
+            guard CFGetTypeID(cfResult) == SecKeyGetTypeID() else {
+                throw KeyStoreError.identityNotFound(identity)
+            }
+            let privateKey = cfResult as! SecKey
+
             guard let publicKey = SecKeyCopyPublicKey(privateKey) else {
                 throw KeyStoreError.keyGenerationFailed
             }
-            
+
             secureEnclaveKeys[identity] = SecureEnclaveKey(
                 privateKey: privateKey,
                 publicKey: publicKey,
-                tag: String(data: tag, encoding: .utf8)!
+                tag: tagString
             )
         }
         

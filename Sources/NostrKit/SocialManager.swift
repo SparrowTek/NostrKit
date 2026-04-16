@@ -829,8 +829,20 @@ public actor SocialManager {
         
         let user = String(parts[0])
         let domain = String(parts[1])
-        
-        let url = URL(string: "https://\(domain)/.well-known/lnurlp/\(user)")!
+
+        // URLComponents percent-encodes the path and validates the domain,
+        // so malformed input produces a clean error instead of crashing.
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = domain
+        components.path = "/.well-known/lnurlp/\(user)"
+
+        guard let url = components.url else {
+            throw NostrError.validationError(
+                field: "address",
+                reason: "Invalid Lightning address"
+            )
+        }
         
         let (data, _) = try await URLSession.shared.data(from: url)
         

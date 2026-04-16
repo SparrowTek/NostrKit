@@ -209,12 +209,13 @@ public actor SubscriptionManager {
             id: subscriptionId
         )
         
-        // Create event stream
-        var continuation: AsyncStream<NostrEvent>.Continuation?
+        // Create event stream. AsyncStream runs the closure synchronously during
+        // init, so the IUO is guaranteed to be assigned before the next line.
+        var continuation: AsyncStream<NostrEvent>.Continuation!
         let events = AsyncStream<NostrEvent> { cont in
             continuation = cont
         }
-        
+
         let managed = ManagedSubscription(
             id: subscriptionId,
             poolSubscription: poolSubscription,
@@ -223,7 +224,7 @@ public actor SubscriptionManager {
             createdAt: Date(),
             lastActivity: Date(),
             events: events,
-            continuation: continuation!
+            continuation: continuation
         )
         
         subscriptions[subscriptionId] = managed
@@ -491,12 +492,14 @@ public actor SubscriptionManager {
         
         stats.subscriptionsMerged += 1
         
-        // Create a virtual subscription that shares the same pool subscription
-        var continuation: AsyncStream<NostrEvent>.Continuation?
+        // Create a virtual subscription that shares the same pool subscription.
+        // AsyncStream's init closure runs synchronously, so the IUO is assigned
+        // before use.
+        var continuation: AsyncStream<NostrEvent>.Continuation!
         let events = AsyncStream<NostrEvent> { cont in
             continuation = cont
         }
-        
+
         let merged = ManagedSubscription(
             id: id,
             poolSubscription: existing.poolSubscription,
@@ -505,7 +508,7 @@ public actor SubscriptionManager {
             createdAt: Date(),
             lastActivity: Date(),
             events: events,
-            continuation: continuation!
+            continuation: continuation
         )
         
         subscriptions[id] = merged

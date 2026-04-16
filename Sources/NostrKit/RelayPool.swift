@@ -777,9 +777,9 @@ public actor PoolSubscription {
 
                 // Check if all relays have sent EOSE
                 let allEOSE = relaySubscriptions.values.allSatisfy { $0 }
-                if allEOSE {
+                if allEOSE, let pool = pool {
                     // All relays have sent their stored events
-                    await pool?.delegate?.relayPool(pool!, subscription: id, receivedEOSEFromAllRelays: true)
+                    await pool.delegate?.relayPool(pool, subscription: id, receivedEOSEFromAllRelays: true)
                 }
             }
 
