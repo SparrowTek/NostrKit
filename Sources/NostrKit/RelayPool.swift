@@ -250,12 +250,9 @@ public actor RelayPool {
         
         relays[url] = relay
 
-        // Start monitoring this relay. Cancel any existing monitor first —
-        // addRelay is documented to replace, not duplicate.
-        monitorTasks[url]?.cancel()
-        monitorTasks[url] = Task { [weak self] in
-            await self?.monitorRelay(url: url)
-        }
+        // Note: the monitor task is started in `connect(to:)`, not here.
+        // RelayService recreates its message stream on each connect, so the
+        // monitor must be (re)created per connection to use the fresh stream.
 
         return relay
     }
@@ -314,6 +311,16 @@ public actor RelayPool {
                 $0.failureCount = 0
                 $0.lastError = nil
                 $0.healthScore = 1.0
+            }
+
+            // Start a fresh monitor for this connection. The previous monitor
+            // (if any) has already exited because its message stream finished
+            // when the prior connection dropped; we cancel defensively in case
+            // it was still in-flight, then attach to the new stream that
+            // `service.connect()` rebuilt.
+            monitorTasks[url]?.cancel()
+            monitorTasks[url] = Task { [weak self] in
+                await self?.monitorRelay(url: url)
             }
 
             // Fetch relay information
@@ -572,7 +579,12 @@ public actor RelayPool {
     private func monitorRelay(url: String) async {
         guard let service = relays[url]?.service else { return }
 
-        for await message in service.messages {
+        // Snapshot the messages stream for this connection. Each call to
+        // `service.connect()` mints a fresh stream, so this loop is bound to
+        // exactly one connection's lifetime; on disconnect it exits and the
+        // next successful connect spawns a new monitor task.
+        let stream = await service.messages
+        for await message in stream {
             // Stats update is done synchronously via the helper so any
             // concurrent mutation (e.g. `publishToRelay` bumping `eventsSent`)
             // isn't overwritten by a stale copy held across an await below.
@@ -615,8 +627,11 @@ public actor RelayPool {
             }
         }
 
-        // Connection dropped
+        // Connection dropped — this monitor task is done. Drop our handle so
+        // a future `connect(to:)` doesn't see a stale entry, then optionally
+        // schedule a reconnection that will spawn a fresh monitor on success.
         mutateRelay(url) { $0.state = .disconnected }
+        monitorTasks.removeValue(forKey: url)
 
         if configuration.autoReconnect {
             await scheduleReconnection(for: url)

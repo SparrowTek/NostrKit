@@ -129,7 +129,11 @@ public actor RelayService {
     
     /// The relay URL
     public let url: String
-    
+
+    /// Buffer size for the message stream, captured so `connect()` can rebuild
+    /// the stream after a prior `disconnect()` with the same policy.
+    private let bufferSize: Int
+
     /// The WebSocket stream for this relay
     private var stream: SocketStream?
 
@@ -139,41 +143,58 @@ public actor RelayService {
 
     /// Current authentication status
     private var authStatus: AuthenticationStatus = .notAuthenticated
-    
+
     /// Authentication handler for NIP-42
     public var authenticator: ((AuthChallenge) async throws -> AuthResponse)?
-    
-    /// Continuation for the message stream
+
+    /// Continuation for the message stream. `disconnect()` finishes it (so
+    /// consumers see the for-await terminate and can react to the drop), and
+    /// `connect()` rebuilds it together with `_messages` so a reconnect can
+    /// start delivering messages on a fresh stream. Callers must therefore
+    /// re-read `messages` after each `connect()` — the previous stream is
+    /// terminal once `disconnect()` ran.
     private var messageContinuation: AsyncStream<RelayMessage>.Continuation?
-    
-    /// Stream of incoming relay messages
-    public let messages: AsyncStream<RelayMessage>
-    
+
+    /// Backing storage for the public ``messages`` stream. Reassigned each
+    /// time ``connect()`` builds a new stream after a prior disconnect.
+    private var _messages: AsyncStream<RelayMessage>
+
+    /// Stream of incoming relay messages.
+    ///
+    /// Each call to ``connect()`` produces a fresh stream once the previous
+    /// connection has been torn down via ``disconnect()``. Re-read this
+    /// property after reconnecting; the prior stream is finished and no new
+    /// values will arrive on it.
+    public var messages: AsyncStream<RelayMessage> {
+        _messages
+    }
+
     /// Whether the relay is currently connected
     public var isConnected: Bool {
         stream != nil
     }
-    
+
     /// Statistics for monitoring performance
     private var droppedMessageCount: Int = 0
     private var totalMessagesReceived: Int = 0
-    
+
     /// Returns statistics about the relay connection
     public var statistics: (received: Int, dropped: Int) {
         (totalMessagesReceived, droppedMessageCount)
     }
-    
+
     // MARK: - Initialization
-    
+
     /// Creates a new relay service for the specified URL
     /// - Parameters:
     ///   - url: The WebSocket URL of the relay
     ///   - bufferSize: Maximum number of messages to buffer (default: 100)
     public init(url: String, bufferSize: Int = 100) {
         self.url = url
-        
-        var continuation: AsyncStream<RelayMessage>.Continuation?
-        self.messages = AsyncStream(bufferingPolicy: .bufferingNewest(bufferSize)) { cont in
+        self.bufferSize = bufferSize
+
+        var continuation: AsyncStream<RelayMessage>.Continuation!
+        self._messages = AsyncStream(bufferingPolicy: .bufferingNewest(bufferSize)) { cont in
             continuation = cont
         }
         self.messageContinuation = continuation
@@ -185,12 +206,25 @@ public actor RelayService {
     /// - Throws: RelayServiceError if connection fails
     public func connect() async throws {
         guard !isConnected else { return }
-        
+
         guard let wsURL = URL(string: url),
               wsURL.scheme == "ws" || wsURL.scheme == "wss" else {
             throw RelayServiceError.invalidURL(url)
         }
-        
+
+        // If a previous `disconnect()` finished the message stream, rebuild
+        // both `_messages` and `messageContinuation` so this connection has
+        // a fresh, live stream. Without this, a successful reconnect would
+        // never deliver messages — the continuation is nil and the stream
+        // has already terminated.
+        if messageContinuation == nil {
+            var continuation: AsyncStream<RelayMessage>.Continuation!
+            self._messages = AsyncStream(bufferingPolicy: .bufferingNewest(bufferSize)) { cont in
+                continuation = cont
+            }
+            self.messageContinuation = continuation
+        }
+
         let task = URLSession.shared.webSocketTask(with: wsURL)
         let socketStream = SocketStream(task: task)
         self.stream = socketStream

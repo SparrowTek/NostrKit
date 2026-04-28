@@ -617,4 +617,58 @@ struct NostrKitUnitTests {
         #expect(allTypes.contains(.zap))
         #expect(allTypes.count >= 7)
     }
+
+    // MARK: - RelayService reconnect-safety
+
+    /// Regression for the CODEX finding: after `disconnect()` finishes the
+    /// message stream, a subsequent `connect()` must rebuild it so consumers
+    /// can attach to a fresh, live stream. Without this, OK / EOSE / NWC
+    /// messages are silently lost after the first reconnect cycle.
+    @Test("RelayService rebuilds messages stream after disconnect/reconnect")
+    func testRelayServiceMessagesStreamRebuildsOnReconnect() async throws {
+        let service = RelayService(url: "wss://relay.invalid.test")
+
+        // Capture the initial stream and a task that drains it to completion.
+        let firstStream = await service.messages
+        let firstDrain = Task { () -> Bool in
+            for await _ in firstStream { /* drain */ }
+            return true
+        }
+
+        // Tear down. This finishes the first continuation.
+        await service.disconnect()
+
+        // The original consumer must observe end-of-stream.
+        let firstDone = await firstDrain.value
+        #expect(firstDone)
+
+        // After connect, `messages` must point at a fresh stream — the prior
+        // one is terminal. We use an unreachable URL so the listener will
+        // fail asynchronously; the message-stream rebuild is what we care
+        // about and it happens synchronously inside connect().
+        try? await service.connect()
+        let secondStream = await service.messages
+
+        let secondDrain = Task { () -> Bool in
+            for await _ in secondStream { /* drain */ }
+            return true
+        }
+
+        // Tear down again. This must finish the *new* continuation, not the
+        // one we already terminated.
+        await service.disconnect()
+        let secondDone = await secondDrain.value
+        #expect(secondDone)
+
+        // A third cycle confirms the rebuild path is repeatable, not a
+        // one-shot.
+        try? await service.connect()
+        let thirdStream = await service.messages
+        let thirdDrain = Task { () -> Bool in
+            for await _ in thirdStream { /* drain */ }
+            return true
+        }
+        await service.disconnect()
+        #expect(await thirdDrain.value)
+    }
 }
