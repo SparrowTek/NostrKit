@@ -63,6 +63,19 @@ public struct WalletSubscription: Sendable {
     public let events: AsyncStream<NostrEvent>
 }
 
+/// A real-time event observed from the active wallet connection.
+///
+/// Emitted by ``WalletConnectManager/events`` when the wallet sends a NIP-47 notification.
+/// This is the public-API counterpart to the on-the-wire ``NWCNotification`` payload —
+/// callers should pattern-match on the case rather than fishing through a JSON dictionary.
+public enum NWCEvent: Sendable, Equatable {
+    /// A payment was received by the wallet.
+    case paymentReceived
+
+    /// A payment was sent from the wallet.
+    case paymentSent
+}
+
 /// Simple token bucket rate limiter used to throttle NWC requests per wallet.
 private struct NWCRateLimiter {
     private let maxTokens: Double
@@ -288,6 +301,7 @@ public class WalletConnectManager {
     private var processedResponses: Set<String> = []
     private var processedNotifications: Set<String> = []
     private var rateLimiter: NWCRateLimiter
+    private var eventContinuations: [UUID: AsyncStream<NWCEvent>.Continuation] = [:]
     
     // Reconnection state
     private var reconnectionTask: Task<Void, Never>?
@@ -2028,35 +2042,78 @@ public class WalletConnectManager {
     
     private func handleNotification(_ event: NostrEvent) async {
         guard let connection = activeConnection else { return }
-        
+
         guard !processedNotifications.contains(event.id) else { return }
         guard event.pubkey == connection.uri.walletPubkey else { return }
         processedNotifications.insert(event.id)
-        
+
         do {
             let decryptedContent = try event.decryptNWCContent(
                 with: connection.uri.secret,
                 peerPubkey: connection.uri.walletPubkey
             )
-            
+
             let notification = try JSONDecoder().decode(NWCNotification.self, from: Data(decryptedContent.utf8))
-            
-            // Handle different notification types
+
+            // Refresh internal state and broadcast to observers
+            let event: NWCEvent
             switch notification.notificationType {
             case .paymentReceived:
                 nwcLogger.info("Payment received notification", metadata: LogMetadata(["wallet": connection.uri.walletPubkey]))
-                // Update balance
-                _ = try? await getBalance()
-                
-            case .paymentSent:
-                nwcLogger.info("Payment sent notification", metadata: LogMetadata(["wallet": connection.uri.walletPubkey]))
-                // Update balance and transaction list
                 _ = try? await getBalance()
                 _ = try? await listTransactions(limit: 10)
+                event = .paymentReceived
+
+            case .paymentSent:
+                nwcLogger.info("Payment sent notification", metadata: LogMetadata(["wallet": connection.uri.walletPubkey]))
+                _ = try? await getBalance()
+                _ = try? await listTransactions(limit: 10)
+                event = .paymentSent
             }
-            
+
+            broadcastEvent(event)
         } catch {
             nwcLogger.error("Failed to handle notification", error: error)
+        }
+    }
+
+    // MARK: - Event Stream
+
+    /// An async stream of high-level wallet events for the active connection.
+    ///
+    /// Emits an ``NWCEvent`` whenever the wallet sends a NIP-47 notification.
+    /// Internal state (balance, recent transactions) is refreshed *before* the
+    /// event is delivered, so observed properties are already up to date when
+    /// a subscriber receives one.
+    ///
+    /// - Note: Events are only emitted by wallets that support NIP-47 notifications
+    ///   (see ``supportsNotifications``). Callers should fall back to polling for
+    ///   wallets that don't.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// for await event in walletManager.events {
+    ///     if event == .paymentReceived {
+    ///         await refreshUI()
+    ///     }
+    /// }
+    /// ```
+    public var events: AsyncStream<NWCEvent> {
+        AsyncStream { continuation in
+            let id = UUID()
+            eventContinuations[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.eventContinuations.removeValue(forKey: id)
+                }
+            }
+        }
+    }
+
+    private func broadcastEvent(_ event: NWCEvent) {
+        for continuation in eventContinuations.values {
+            continuation.yield(event)
         }
     }
     
