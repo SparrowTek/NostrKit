@@ -6,8 +6,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/SparrowTek/CoreNostr.git",
       "state" : {
-        "revision" : "7ec32d4b6a0956b1b1927ca62bacdfd835ee8782",
-        "version" : "3.0.0"
+        "revision" : "b78be6445fa9b736f729eb74ab981e0671bf5472",
+        "version" : "3.0.1"
       }
     },
     {
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-asn1.git",
       "state" : {
-        "revision" : "eb50cbd14606a9161cbc5d452f18797c90ef0bab",
-        "version" : "1.7.0"
+        "revision" : "a9a5efd40eaf558a2bcd48d64b1d1646be686008",
+        "version" : "1.7.1"
       }
     },
     {
@@ -33,8 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/21-DOT-DEV/swift-secp256k1",
       "state" : {
-        "revision" : "cfab52e538683557259302c39ef25df60226eb30",
-        "version" : "0.23.1"
+        "revision" : "e70a10e036a55fffea31568f0af92d69b6d449cd",
+        "version" : "0.23.2"
       }
     }
   ],

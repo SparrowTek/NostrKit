@@ -63,17 +63,86 @@ public struct WalletSubscription: Sendable {
     public let events: AsyncStream<NostrEvent>
 }
 
+/// Payment details delivered with a NIP-47 wallet notification.
+///
+/// Mirrors the notification payload fields defined by NIP-47. Every field the
+/// wallet omitted is `nil` — wallets vary in how much they report.
+public struct NWCPaymentNotification: Sendable, Equatable {
+    /// Whether the payment was incoming or outgoing.
+    public let type: NWCTransactionType
+
+    /// The payment state (usually `.settled` for notifications), if reported.
+    public let state: NWCTransactionState?
+
+    /// The BOLT11 invoice, if reported.
+    public let invoice: String?
+
+    /// The invoice description, if reported.
+    public let description: String?
+
+    /// The payment preimage, if reported.
+    public let preimage: String?
+
+    /// The payment hash identifying this payment, if reported.
+    public let paymentHash: String?
+
+    /// The amount in millisatoshis, if reported.
+    public let amount: Int64?
+
+    /// Fees paid in millisatoshis, if reported.
+    public let feesPaid: Int64?
+
+    /// When the invoice/payment was created, if reported.
+    public let createdAt: Date?
+
+    /// When the payment settled, if reported.
+    public let settledAt: Date?
+
+    public init(
+        type: NWCTransactionType,
+        state: NWCTransactionState? = nil,
+        invoice: String? = nil,
+        description: String? = nil,
+        preimage: String? = nil,
+        paymentHash: String? = nil,
+        amount: Int64? = nil,
+        feesPaid: Int64? = nil,
+        createdAt: Date? = nil,
+        settledAt: Date? = nil
+    ) {
+        self.type = type
+        self.state = state
+        self.invoice = invoice
+        self.description = description
+        self.preimage = preimage
+        self.paymentHash = paymentHash
+        self.amount = amount
+        self.feesPaid = feesPaid
+        self.createdAt = createdAt
+        self.settledAt = settledAt
+    }
+}
+
 /// A real-time event observed from the active wallet connection.
 ///
 /// Emitted by ``WalletConnectManager/events`` when the wallet sends a NIP-47 notification.
 /// This is the public-API counterpart to the on-the-wire ``NWCNotification`` payload —
-/// callers should pattern-match on the case rather than fishing through a JSON dictionary.
+/// pattern-match on the case and read the attached ``NWCPaymentNotification``
+/// rather than fishing through a JSON dictionary.
 public enum NWCEvent: Sendable, Equatable {
     /// A payment was received by the wallet.
-    case paymentReceived
+    case paymentReceived(NWCPaymentNotification)
 
     /// A payment was sent from the wallet.
-    case paymentSent
+    case paymentSent(NWCPaymentNotification)
+
+    /// The payment details attached to the event.
+    public var payment: NWCPaymentNotification {
+        switch self {
+        case .paymentReceived(let payment), .paymentSent(let payment):
+            return payment
+        }
+    }
 }
 
 /// Simple token bucket rate limiter used to throttle NWC requests per wallet.
@@ -190,7 +259,10 @@ public class WalletConnectManager {
         public let id: String
         
         /// The parsed NWC connection URI containing wallet pubkey, relays, and secret.
-        public let uri: NWCConnectionURI
+        ///
+        /// Updated in place when the user re-pairs with the same wallet service
+        /// using a rotated secret or different relays.
+        public fileprivate(set) var uri: NWCConnectionURI
         
         /// Optional human-readable alias for this wallet connection.
         public let alias: String?
@@ -298,8 +370,8 @@ public class WalletConnectManager {
     private var notificationSubscription: String?
     private var notificationTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
-    private var processedResponses: Set<String> = []
-    private var processedNotifications: Set<String> = []
+    private var processedResponses: [String: Date] = [:]
+    private var processedNotifications: [String: Date] = [:]
     private var rateLimiter: NWCRateLimiter
     private var eventContinuations: [UUID: AsyncStream<NWCEvent>.Continuation] = [:]
     
@@ -310,6 +382,24 @@ public class WalletConnectManager {
     
     /// Maximum age for processed response/notification IDs before cleanup (1 hour)
     private static let processedIdMaxAge: TimeInterval = 3600
+
+    /// Cache size that triggers pruning of processed response/notification IDs
+    private static let processedIdPruneThreshold = 256
+
+    /// Records an event ID as processed, pruning the cache so it stays bounded
+    /// over a long-lived connection.
+    private func markProcessed(_ id: String, in cache: inout [String: Date]) {
+        let now = Date()
+        if cache.count >= Self.processedIdPruneThreshold {
+            cache = cache.filter { now.timeIntervalSince($0.value) < Self.processedIdMaxAge }
+            if cache.count >= Self.processedIdPruneThreshold {
+                // Everything is still fresh — drop the oldest half to bound memory.
+                let sorted = cache.sorted { $0.value < $1.value }
+                cache = Dictionary(uniqueKeysWithValues: sorted.suffix(sorted.count / 2))
+            }
+        }
+        cache[id] = now
+    }
     
     /// Maximum reconnection attempts before giving up
     private static let maxReconnectionAttempts: Int = 10
@@ -413,8 +503,20 @@ public class WalletConnectManager {
 
         // Check if already connected to this wallet and relay is connected
         if let existingIndex = connections.firstIndex(where: { $0.uri.walletPubkey == nwcURI.walletPubkey }) {
+            // A wallet service may reuse its pubkey across pairings while rotating
+            // the secret (or relays). Adopt the URI from the freshly scanned code —
+            // the stored secret may have been revoked on the wallet side.
+            let uriChanged = connections[existingIndex].uri.secret != nwcURI.secret
+                || connections[existingIndex].uri.relays != nwcURI.relays
+                || connections[existingIndex].uri.lud16 != nwcURI.lud16
+            if uriChanged {
+                connections[existingIndex].uri = nwcURI
+                await saveConnections()
+            }
+
             // Already have a connection to this wallet
-            if activeConnection?.uri.walletPubkey == nwcURI.walletPubkey,
+            if !uriChanged,
+               activeConnection?.uri.walletPubkey == nwcURI.walletPubkey,
                case .connected = connectionState {
                 // Already active and connected, nothing to do
                 return
@@ -718,7 +820,8 @@ public class WalletConnectManager {
             params: params,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
-            encryption: try resolveEncryption()
+            encryption: try resolveEncryption(),
+            expiration: requestExpiration()
         )
         
         // Send request and wait for response
@@ -783,22 +886,35 @@ public class WalletConnectManager {
     ///
     /// - Note: The balance is also stored in the ``balance`` published property for observation.
     public func getBalance() async throws -> Int64 {
-        guard let connection = activeConnection else {
+        guard activeConnection != nil else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
         }
         guard supportsMethod(.getBalance) else {
             throw NWCError(code: .notImplemented, message: "Wallet does not support balance queries")
         }
         try enforceRateLimit()
-        
+        return try await fetchBalance()
+    }
+
+    /// Fetches the balance without consuming a rate-limiter token.
+    /// Used by user calls (after rate limiting) and internal notification refreshes.
+    private func fetchBalance() async throws -> Int64 {
+        guard let connection = activeConnection else {
+            throw NWCError(code: .unauthorized, message: "No active wallet connection")
+        }
+        guard supportsMethod(.getBalance) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support balance queries")
+        }
+
         isLoading = true
         defer { isLoading = false }
-        
+
         let requestEvent = try NostrEvent.nwcRequest(
             method: .getBalance,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
-            encryption: try resolveEncryption()
+            encryption: try resolveEncryption(),
+            expiration: requestExpiration()
         )
         
         let response = try await sendRequestAndWaitForResponse(requestEvent)
@@ -881,7 +997,8 @@ public class WalletConnectManager {
             params: params,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
-            encryption: try resolveEncryption()
+            encryption: try resolveEncryption(),
+            expiration: requestExpiration()
         )
         
         let response = try await sendRequestAndWaitForResponse(requestEvent)
@@ -945,17 +1062,29 @@ public class WalletConnectManager {
     ///
     /// - Note: The transactions are also stored in ``recentTransactions`` for observation.
     public func listTransactions(from: Date? = nil, until: Date? = nil, limit: Int? = nil, offset: Int? = nil, unpaid: Bool? = nil, type: NWCTransactionType? = nil) async throws -> [NWCTransaction] {
-        guard let connection = activeConnection else {
+        guard activeConnection != nil else {
             throw NWCError(code: .unauthorized, message: "No active wallet connection")
         }
         guard supportsMethod(.listTransactions) else {
             throw NWCError(code: .notImplemented, message: "Wallet does not support transaction listing")
         }
         try enforceRateLimit()
-        
+        return try await fetchTransactions(from: from, until: until, limit: limit, offset: offset, unpaid: unpaid, type: type)
+    }
+
+    /// Fetches transactions without consuming a rate-limiter token.
+    /// Used by user calls (after rate limiting) and internal notification refreshes.
+    private func fetchTransactions(from: Date? = nil, until: Date? = nil, limit: Int? = nil, offset: Int? = nil, unpaid: Bool? = nil, type: NWCTransactionType? = nil) async throws -> [NWCTransaction] {
+        guard let connection = activeConnection else {
+            throw NWCError(code: .unauthorized, message: "No active wallet connection")
+        }
+        guard supportsMethod(.listTransactions) else {
+            throw NWCError(code: .notImplemented, message: "Wallet does not support transaction listing")
+        }
+
         isLoading = true
         defer { isLoading = false }
-        
+
         var params: [String: AnyCodable] = [:]
         if let from = from {
             params["from"] = AnyCodable(Int64(from.timeIntervalSince1970))
@@ -981,7 +1110,8 @@ public class WalletConnectManager {
             params: params,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
-            encryption: try resolveEncryption()
+            encryption: try resolveEncryption(),
+            expiration: requestExpiration()
         )
         
         let response = try await sendRequestAndWaitForResponse(requestEvent)
@@ -1095,18 +1225,19 @@ public class WalletConnectManager {
         }
         
         if let tlvRecords = tlvRecords, !tlvRecords.isEmpty {
-            let tlvArray = tlvRecords.map { record in
-                ["type": AnyCodable(record.type), "value": AnyCodable(record.value)]
+            let tlvArray: [[String: Any]] = tlvRecords.map { record in
+                ["type": record.type, "value": record.value]
             }
             params["tlv_records"] = AnyCodable(tlvArray)
         }
-        
+
         let requestEvent = try NostrEvent.nwcRequest(
             method: .payKeysend,
             params: params,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
-            encryption: try resolveEncryption()
+            encryption: try resolveEncryption(),
+            expiration: requestExpiration()
         )
         
         let response = try await sendRequestAndWaitForResponse(requestEvent)
@@ -1261,7 +1392,8 @@ public class WalletConnectManager {
             params: params,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
-            encryption: try resolveEncryption()
+            encryption: try resolveEncryption(),
+            expiration: requestExpiration()
         )
         
         let response = try await sendRequestAndWaitForResponse(requestEvent)
@@ -1408,7 +1540,8 @@ public class WalletConnectManager {
             method: .getInfo,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
-            encryption: try resolveEncryption()
+            encryption: try resolveEncryption(),
+            expiration: requestExpiration()
         )
 
         let response = try await sendRequestAndWaitForResponse(requestEvent)
@@ -1561,18 +1694,19 @@ public class WalletConnectManager {
         isLoading = true
         defer { isLoading = false }
         
-        // Build invoices array
-        let invoicesParams: [[String: AnyCodable]] = invoices.map { inv in
-            var dict: [String: AnyCodable] = ["invoice": AnyCodable(inv.invoice)]
+        // Build invoices array as plain values — AnyCodable wraps the whole
+        // structure once at the top level.
+        let invoicesParams: [[String: Any]] = invoices.map { inv in
+            var dict: [String: Any] = ["invoice": inv.invoice]
             if let id = inv.id {
-                dict["id"] = AnyCodable(id)
+                dict["id"] = id
             }
             if let amount = inv.amount {
-                dict["amount"] = AnyCodable(amount)
+                dict["amount"] = amount
             }
             return dict
         }
-        
+
         let params: [String: AnyCodable] = ["invoices": AnyCodable(invoicesParams)]
         
         let requestEvent = try NostrEvent.nwcRequest(
@@ -1580,7 +1714,8 @@ public class WalletConnectManager {
             params: params,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
-            encryption: try resolveEncryption()
+            encryption: try resolveEncryption(),
+            expiration: requestExpiration(timeoutNanoseconds: batchResponseTimeoutNanoseconds)
         )
         
         // For multi_pay, we need to collect multiple response events
@@ -1649,27 +1784,28 @@ public class WalletConnectManager {
         isLoading = true
         defer { isLoading = false }
         
-        // Build keysends array
-        let keysendsParams: [[String: AnyCodable]] = keysends.map { ks in
-            var dict: [String: AnyCodable] = [
-                "pubkey": AnyCodable(ks.pubkey),
-                "amount": AnyCodable(ks.amount)
+        // Build keysends array as plain values — AnyCodable wraps the whole
+        // structure once at the top level.
+        let keysendsParams: [[String: Any]] = keysends.map { ks in
+            var dict: [String: Any] = [
+                "pubkey": ks.pubkey,
+                "amount": ks.amount
             ]
             if let id = ks.id {
-                dict["id"] = AnyCodable(id)
+                dict["id"] = id
             }
             if let preimage = ks.preimage {
-                dict["preimage"] = AnyCodable(preimage)
+                dict["preimage"] = preimage
             }
             if let tlvRecords = ks.tlvRecords, !tlvRecords.isEmpty {
-                let tlvArray = tlvRecords.map { record in
-                    ["type": AnyCodable(record.type), "value": AnyCodable(record.value)]
+                let tlvArray: [[String: Any]] = tlvRecords.map { record in
+                    ["type": record.type, "value": record.value]
                 }
-                dict["tlv_records"] = AnyCodable(tlvArray)
+                dict["tlv_records"] = tlvArray
             }
             return dict
         }
-        
+
         let params: [String: AnyCodable] = ["keysends": AnyCodable(keysendsParams)]
         
         let requestEvent = try NostrEvent.nwcRequest(
@@ -1677,7 +1813,8 @@ public class WalletConnectManager {
             params: params,
             walletPubkey: connection.uri.walletPubkey,
             clientSecret: connection.uri.secret,
-            encryption: try resolveEncryption()
+            encryption: try resolveEncryption(),
+            expiration: requestExpiration(timeoutNanoseconds: batchResponseTimeoutNanoseconds)
         )
         
         return try await collectMultiPayResponses(
@@ -1715,16 +1852,19 @@ public class WalletConnectManager {
         var results: [BatchPaymentResult] = []
         let walletPubkey = connection.uri.walletPubkey
         let secret = connection.uri.secret
-        
+        let timeout = batchResponseTimeoutNanoseconds
+
         do {
-            try await withThrowingTaskGroup(of: [BatchPaymentResult].self) { group in
-                // Response collection task
+            results = try await withThrowingTaskGroup(of: [BatchPaymentResult]?.self) { group in
+                // Response collection task. Returns non-nil; the timeout task
+                // returns nil so the two are distinguishable below.
                 group.addTask {
                     var collected: [BatchPaymentResult] = []
                     for await event in subscription.events {
                         guard event.pubkey == walletPubkey else { continue }
                         guard event.kind == EventKind.nwcResponse.rawValue else { continue }
-                        
+                        guard (try? CoreNostr.verifyEvent(event)) == true else { continue }
+
                         // Parse this response
                         if let result = try? await self.parseMultiPayResponse(event, secret: secret, walletPubkey: walletPubkey) {
                             collected.append(result)
@@ -1735,25 +1875,35 @@ public class WalletConnectManager {
                     }
                     return collected
                 }
-                
-                // Timeout task (60 seconds for batch operations)
+
+                // Timeout marker task
                 group.addTask {
-                    try await Task.sleep(nanoseconds: 60_000_000_000)
-                    return []
+                    try? await Task.sleep(nanoseconds: timeout)
+                    return nil
                 }
-                
-                if let first = try await group.next(), !first.isEmpty {
-                    results = first
+
+                if let first = try await group.next(), let collected = first {
+                    // Collector finished (full batch, or the stream ended) first.
                     group.cancelAll()
+                    return collected
                 }
+
+                // Deadline elapsed. Cancel the collector — AsyncStream iteration
+                // honors cancellation, so it promptly returns whatever partial
+                // results it gathered, which we surface to the caller.
+                group.cancelAll()
+                if let partial = try await group.next(), let collected = partial {
+                    return collected
+                }
+                return []
             }
         } catch {
-            // Timeout or cancellation - return what we have
+            // Cancellation - return what we have
         }
-        
+
         await relayPool.closeSubscription(id: subscription.id)
         subscriptions.removeValue(forKey: request.id)
-        
+
         return results
     }
     
@@ -1862,7 +2012,15 @@ public class WalletConnectManager {
                 // Task 1: Listen for info events
                 group.addTask {
                     for await event in subscription.events {
-                        // Return the first matching event
+                        // Only trust a validly signed info event from the wallet
+                        // service itself. The info event is plaintext, so without
+                        // this check a malicious relay could forge capabilities —
+                        // e.g. advertise nip04-only to downgrade encryption.
+                        guard event.kind == EventKind.nwcInfo.rawValue,
+                              event.pubkey == walletPubkey,
+                              (try? CoreNostr.verifyEvent(event)) == true else {
+                            continue
+                        }
                         return event
                     }
                     // Stream ended without finding an event
@@ -1899,6 +2057,18 @@ public class WalletConnectManager {
     
     /// Timeout duration for NWC requests (60 seconds)
     private static let requestTimeoutNanoseconds: UInt64 = 60_000_000_000
+
+    /// Timeout for collecting the full set of batch (multi_pay_*) responses.
+    /// Internal so tests can shorten it.
+    var batchResponseTimeoutNanoseconds: UInt64 = 60_000_000_000
+
+    /// Expiration timestamp attached to outgoing requests (NIP-47 `expiration`
+    /// tag). Matches the response-wait window so the wallet service ignores
+    /// requests the client has already given up waiting on — without it, a
+    /// wallet could execute a payment minutes after the app reported a timeout.
+    private func requestExpiration(timeoutNanoseconds: UInt64 = WalletConnectManager.requestTimeoutNanoseconds) -> Date {
+        Date().addingTimeInterval(TimeInterval(timeoutNanoseconds) / 1_000_000_000)
+    }
     
     private func sendRequestAndWaitForResponse(_ request: NostrEvent) async throws -> NostrEvent {
         guard let connection = activeConnection else {
@@ -1927,8 +2097,9 @@ public class WalletConnectManager {
 
         // Capture values needed by the task to avoid actor isolation issues
         let walletPubkey = connection.uri.walletPubkey
+        let clientSecret = connection.uri.secret
         let requestId = request.id
-        
+
         // Wait for response with timeout using TaskGroup for proper cancellation
         // This ensures that when one task completes (either timeout or response),
         // the other is automatically cancelled, preventing race conditions.
@@ -1945,13 +2116,22 @@ public class WalletConnectManager {
                         guard event.tags.contains(where: { $0.count >= 2 && $0[0] == "e" && $0[1] == requestId }) else {
                             continue
                         }
+                        // Only accept events that authenticate. A relay can inject an
+                        // event with the wallet's pubkey on it, but it cannot forge the
+                        // signature or produce content that decrypts under the shared
+                        // secret — skip junk and keep waiting for the real response.
+                        guard (try? CoreNostr.verifyEvent(event)) == true else { continue }
+                        guard let content = try? event.decryptNWCContent(with: clientSecret, peerPubkey: walletPubkey),
+                              (try? JSONDecoder().decode(NWCResponse.self, from: Data(content.utf8))) != nil else {
+                            continue
+                        }
                         return event
                     }
                     // Stream ended without finding a matching event
                     return nil
                 }
-                
-                // Task 2: Timeout after 30 seconds
+
+                // Task 2: Timeout (see requestTimeoutNanoseconds)
                 group.addTask {
                     try await Task.sleep(nanoseconds: Self.requestTimeoutNanoseconds)
                     return nil // Signal timeout by returning nil
@@ -1976,12 +2156,12 @@ public class WalletConnectManager {
             }
             
             // Check if we already processed this response (prevents duplicate handling)
-            guard !processedResponses.contains(result.id) else {
+            guard processedResponses[result.id] == nil else {
                 throw NWCError(code: .other, message: "Duplicate response received")
             }
-            
+
             // Mark response as processed and clean up
-            processedResponses.insert(result.id)
+            markProcessed(result.id, in: &processedResponses)
             await relayPool.closeSubscription(id: subscription.id)
             subscriptions.removeValue(forKey: request.id)
             
@@ -2004,22 +2184,41 @@ public class WalletConnectManager {
         // Cancel any existing notification task first
         notificationTask?.cancel()
         notificationTask = nil
-        
+
+        // Close any previous notification subscription so repeated
+        // reconnects don't leak open subscriptions on the relay.
+        if let existingSubscription = notificationSubscription {
+            await relayPool.closeSubscription(id: existingSubscription)
+            notificationSubscription = nil
+        }
+
         guard let connection = activeConnection else { return }
-        
+
         // Check if wallet supports notifications
         guard let capabilities = connection.capabilities,
               !capabilities.notifications.isEmpty else {
             return
         }
-        
+
         guard let clientPubkey = try? KeyPair(privateKey: connection.uri.secret).publicKey else {
             nwcLogger.error("Failed to derive client pubkey for notifications")
             return
         }
+
+        // Per NIP-47, a wallet service that supports both encryption schemes
+        // publishes every notification twice: kind 23197 (NIP-44) and kind 23196
+        // (NIP-04). Listen to exactly one — matching the negotiated encryption —
+        // otherwise each payment event is delivered and processed twice.
+        let notificationKind: EventKind
+        if capabilities.encryptionSchemes.contains(.nip44) {
+            notificationKind = .nwcNotification
+        } else {
+            notificationKind = .nwcNotificationLegacy
+        }
+
         let filter = Filter(
             authors: [connection.uri.walletPubkey],
-            kinds: [EventKind.nwcNotification.rawValue, EventKind.nwcNotificationLegacy.rawValue],
+            kinds: [notificationKind.rawValue],
             p: [clientPubkey]
         )
         
@@ -2043,9 +2242,10 @@ public class WalletConnectManager {
     private func handleNotification(_ event: NostrEvent) async {
         guard let connection = activeConnection else { return }
 
-        guard !processedNotifications.contains(event.id) else { return }
+        guard processedNotifications[event.id] == nil else { return }
         guard event.pubkey == connection.uri.walletPubkey else { return }
-        processedNotifications.insert(event.id)
+        guard (try? CoreNostr.verifyEvent(event)) == true else { return }
+        markProcessed(event.id, in: &processedNotifications)
 
         do {
             let decryptedContent = try event.decryptNWCContent(
@@ -2054,27 +2254,59 @@ public class WalletConnectManager {
             )
 
             let notification = try JSONDecoder().decode(NWCNotification.self, from: Data(decryptedContent.utf8))
+            let payment = makePaymentNotification(from: notification)
 
-            // Refresh internal state and broadcast to observers
-            let event: NWCEvent
+            let nwcEvent: NWCEvent
             switch notification.notificationType {
             case .paymentReceived:
                 nwcLogger.info("Payment received notification", metadata: LogMetadata(["wallet": connection.uri.walletPubkey]))
-                _ = try? await getBalance()
-                _ = try? await listTransactions(limit: 10)
-                event = .paymentReceived
-
+                nwcEvent = .paymentReceived(payment)
             case .paymentSent:
                 nwcLogger.info("Payment sent notification", metadata: LogMetadata(["wallet": connection.uri.walletPubkey]))
-                _ = try? await getBalance()
-                _ = try? await listTransactions(limit: 10)
-                event = .paymentSent
+                nwcEvent = .paymentSent(payment)
             }
 
-            broadcastEvent(event)
+            // Refresh internal state before broadcasting so observed properties
+            // are already up to date when subscribers receive the event. These
+            // are internal refreshes — they bypass the rate limiter so wallet
+            // activity can't starve user-initiated operations of tokens.
+            _ = try? await fetchBalance()
+            _ = try? await fetchTransactions(limit: 10)
+
+            broadcastEvent(nwcEvent)
         } catch {
             nwcLogger.error("Failed to handle notification", error: error)
         }
+    }
+
+    /// Builds the public notification payload from the on-the-wire NIP-47 object.
+    private func makePaymentNotification(from notification: NWCNotification) -> NWCPaymentNotification {
+        let fields = notification.notification
+
+        // The payload's own type field wins; fall back to the direction implied
+        // by the notification type when the wallet omits it.
+        let type: NWCTransactionType
+        if let typeString = fields["type"]?.value as? String,
+           let parsed = NWCTransactionType(rawValue: typeString) {
+            type = parsed
+        } else {
+            type = notification.notificationType == .paymentReceived ? .incoming : .outgoing
+        }
+
+        let state = (fields["state"]?.value as? String).flatMap { NWCTransactionState(rawValue: $0) }
+
+        return NWCPaymentNotification(
+            type: type,
+            state: state,
+            invoice: fields["invoice"]?.value as? String,
+            description: fields["description"]?.value as? String,
+            preimage: fields["preimage"]?.value as? String,
+            paymentHash: fields["payment_hash"]?.value as? String,
+            amount: extractInt64(from: fields["amount"]),
+            feesPaid: extractInt64(from: fields["fees_paid"]),
+            createdAt: extractInt64(from: fields["created_at"]).map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            settledAt: extractInt64(from: fields["settled_at"]).map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        )
     }
 
     // MARK: - Event Stream
@@ -2094,7 +2326,8 @@ public class WalletConnectManager {
     ///
     /// ```swift
     /// for await event in walletManager.events {
-    ///     if event == .paymentReceived {
+    ///     if case .paymentReceived(let payment) = event {
+    ///         print("Received \(payment.amount ?? 0) msat")
     ///         await refreshUI()
     ///     }
     /// }

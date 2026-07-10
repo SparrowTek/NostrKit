@@ -222,6 +222,24 @@ actor MockRelayPool: RelayPoolProtocol, WalletRelayPool {
             }
         }
     }
+
+    /// Yields an event to every active subscription whose filters match it.
+    func yieldToMatchingSubscriptions(_ event: NostrEvent) {
+        for subscription in activeSubscriptions.values {
+            if matchesAnyFilter(event: event, filters: subscription.filters) {
+                subscription.continuation.yield(event)
+            }
+        }
+    }
+
+    /// Filters of all currently active subscriptions (for asserting on subscription shape).
+    func activeSubscriptionFilters() -> [[Filter]] {
+        activeSubscriptions.values.map { $0.filters }
+    }
+
+    func activeSubscriptionCount() -> Int {
+        activeSubscriptions.count
+    }
     
     private func matchesAnyFilter(event: NostrEvent, filters: [Filter]) -> Bool {
         for filter in filters {
