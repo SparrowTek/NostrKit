@@ -605,18 +605,26 @@ public class WalletConnectManager {
     /// `connectAll()` returns once each dial attempt resolves, but a dial that
     /// loses the race against a cold network stack (common in the first moments
     /// after app launch) leaves the pool empty even though the relay is
-    /// reachable moments later. Retry with a short backoff before declaring the
-    /// wallet unreachable, so requests that follow never see an empty pool.
+    /// reachable moments later. Poll for a connection over a deadline, nudging
+    /// failed relays back into a dial every couple of seconds — `connect(to:)`
+    /// is idempotent for connected and in-flight relays, so the nudge never
+    /// disturbs a socket that is already up or mid-handshake.
     private func establishRelayConnections() async throws {
-        let maxAttempts = 4
-        var delay: Duration = .milliseconds(500)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(10))
 
-        for attempt in 1...maxAttempts {
-            await relayPool.connectAll()
+        await relayPool.connectAll()
+        var lastDial = clock.now
+
+        while clock.now < deadline {
             if await relayPool.hasConnectedRelay { return }
-            guard attempt < maxAttempts else { break }
-            try? await Task.sleep(for: delay)
-            delay *= 2
+
+            if clock.now - lastDial > .seconds(2) {
+                await relayPool.connectAll()
+                lastDial = clock.now
+            }
+
+            try? await Task.sleep(for: .milliseconds(250))
         }
 
         throw NWCError(code: .other, message: "Unable to reach any wallet relay")

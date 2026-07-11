@@ -300,6 +300,19 @@ public actor RelayPool {
             throw NostrError.notFound(resource: "Relay with URL \(url)")
         }
 
+        // A live connection stays live — re-dialing a healthy socket tears it
+        // down mid-flight (cancelling handshakes and NIP-11 fetches) only to
+        // rebuild what already worked.
+        if relays[url]?.state == .connected { return }
+
+        // A dial is already in flight — wait for it to resolve rather than
+        // stomping the half-open socket with a second dial. Concurrent callers
+        // (retry loops, auto-reconnect timers) all converge on the one dial.
+        if relays[url]?.state == .connecting || relays[url]?.state == .reconnecting {
+            try await waitForInFlightDial(url: url)
+            return
+        }
+
         mutateRelay(url) { $0.state = .connecting }
 
         do {
@@ -347,7 +360,33 @@ public actor RelayPool {
             throw error
         }
     }
-    
+
+    /// Waits for an in-flight dial on `url` to resolve.
+    ///
+    /// Returns once the relay reaches `.connected`; throws the dial's error if
+    /// it resolves to a failure, or `RelayError.timeout` if it never resolves
+    /// within the deadline. Sleeping yields the actor, so the owning dial makes
+    /// progress while callers wait.
+    private func waitForInFlightDial(url: String, deadline: Duration = .seconds(15)) async throws {
+        let clock = ContinuousClock()
+        let start = clock.now
+
+        while clock.now - start < deadline {
+            switch relays[url]?.state {
+            case .connected:
+                return
+            case .connecting, .reconnecting:
+                try? await Task.sleep(for: .milliseconds(100))
+            case .failed, .disconnected:
+                throw relays[url]?.lastError ?? RelayError.notConnected
+            case nil:
+                throw NostrError.notFound(resource: "Relay with URL \(url)")
+            }
+        }
+
+        throw RelayError.timeout
+    }
+
     /// Connects to all relays in the pool
     public func connectAll() async {
         await withTaskGroup(of: Void.self) { group in
