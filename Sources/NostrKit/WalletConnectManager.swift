@@ -13,6 +13,10 @@ import OSLog
 // MARK: - RelayPool Conformance
 
 extension RelayPool: WalletRelayPool {
+    var hasConnectedRelay: Bool {
+        !connectedRelays.isEmpty
+    }
+
     func addRelay(url: String) async throws {
         _ = try self.addRelay(url: url, metadata: nil)
     }
@@ -49,6 +53,7 @@ protocol WalletStorage: Actor {
 }
 
 protocol WalletRelayPool: Actor {
+    var hasConnectedRelay: Bool { get }
     func addRelay(url: String) async throws
     func connectAll() async
     func publish(_ event: NostrEvent) async -> [RelayPool.PublishResult]
@@ -532,7 +537,7 @@ public class WalletConnectManager {
                 for relay in nwcURI.relays {
                     try await relayPool.addRelay(url: relay)
                 }
-                await relayPool.connectAll()
+                try await establishRelayConnections()
 
                 // Refresh capabilities (they may be stale from keychain)
                 if let info = try await fetchWalletInfo(walletPubkey: nwcURI.walletPubkey) {
@@ -565,7 +570,7 @@ public class WalletConnectManager {
             }
 
             // Connect to relays
-            await relayPool.connectAll()
+            try await establishRelayConnections()
 
             // Create and store connection
             var connection = WalletConnection(uri: nwcURI, alias: alias)
@@ -595,6 +600,28 @@ public class WalletConnectManager {
         }
     }
     
+    /// Dials the pool's relays and waits until at least one is connected.
+    ///
+    /// `connectAll()` returns once each dial attempt resolves, but a dial that
+    /// loses the race against a cold network stack (common in the first moments
+    /// after app launch) leaves the pool empty even though the relay is
+    /// reachable moments later. Retry with a short backoff before declaring the
+    /// wallet unreachable, so requests that follow never see an empty pool.
+    private func establishRelayConnections() async throws {
+        let maxAttempts = 4
+        var delay: Duration = .milliseconds(500)
+
+        for attempt in 1...maxAttempts {
+            await relayPool.connectAll()
+            if await relayPool.hasConnectedRelay { return }
+            guard attempt < maxAttempts else { break }
+            try? await Task.sleep(for: delay)
+            delay *= 2
+        }
+
+        throw NWCError(code: .other, message: "Unable to reach any wallet relay")
+    }
+
     /// Disconnects from the currently active wallet.
     ///
     /// This method closes all active subscriptions, disconnects from relays,
@@ -734,9 +761,9 @@ public class WalletConnectManager {
             for relay in connection.uri.relays {
                 try await relayPool.addRelay(url: relay)
             }
-            
+
             // Connect to relays
-            await relayPool.connectAll()
+            try await establishRelayConnections()
             
             connectionState = .connected
             

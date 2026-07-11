@@ -76,6 +76,11 @@ actor MockRelayPool: RelayPoolProtocol, WalletRelayPool {
         }
     }
     
+    var hasConnectedRelay: Bool {
+        // Mocks eagerly connect in addRelay
+        !mockRelays.isEmpty
+    }
+
     func connectAll() async {
         // Mocks eagerly connect in addRelay
     }
