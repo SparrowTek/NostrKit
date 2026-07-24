@@ -178,18 +178,22 @@ public class RemoteSignerManager {
     
     /// Client keypair used for encryption with the signer.
     private var clientKeyPair: KeyPair?
-    
-    /// Active subscriptions: requestId -> subscriptionId
-    private var subscriptions: [String: String] = [:]
-    
-    /// Subscription for incoming responses.
+
+    /// The standing response subscription id. One subscription serves every
+    /// request; responses are routed to their waiters by request id.
     private var responseSubscription: String?
-    
-    /// Task listening for responses.
+
+    /// Task draining the standing subscription and routing responses.
     private var responseListenerTask: Task<Void, Never>?
-    
-    /// Set of processed response IDs to prevent duplicates.
-    private var processedResponses: Set<String> = []
+
+    /// Continuations awaiting a response, keyed by request id. MainActor
+    /// isolation makes claim-and-resume atomic between the router, the
+    /// timeout, and teardown — each id resumes exactly once.
+    private var pendingRequests: [String: CheckedContinuation<NIP46.Response, Error>] = [:]
+
+    /// Recently seen response ids (bounded) so relay re-deliveries are
+    /// dropped instead of accumulating forever.
+    private var processedResponses = BoundedIDSet(capacity: 1024)
     
     /// Rate limiter for requests.
     private var rateLimiter: SignerRateLimiter
@@ -375,9 +379,15 @@ public class RemoteSignerManager {
         url: String? = nil,
         image: String? = nil
     ) throws -> NIP46.NostrConnectURI {
-        // Generate client keypair if needed
-        let clientKP = try KeyPair.generate()
-        self.clientKeyPair = clientKP
+        // Reuse the stored client keypair when one exists — regenerating on
+        // every call would orphan a previously displayed QR code.
+        let clientKP: KeyPair
+        if let existing = clientKeyPair {
+            clientKP = existing
+        } else {
+            clientKP = try KeyPair.generate()
+            self.clientKeyPair = clientKP
+        }
         
         // Generate a random secret
         var secretBytes = [UInt8](repeating: 0, count: 32)
@@ -463,8 +473,11 @@ public class RemoteSignerManager {
                                 signerPubkey: event.pubkey
                             )
                             
-                            // Check for "ack" or secret match
-                            if response.result == "ack" || response.result == uri.secret {
+                            // Spec: the client MUST validate the returned
+                            // secret. Accepting a bare "ack" here would let
+                            // anyone who saw the QR code race the real signer
+                            // and hijack the session.
+                            if response.result == uri.secret {
                                 return event
                             }
                         } catch {
@@ -542,30 +555,27 @@ public class RemoteSignerManager {
     /// The connection can be re-established using `reconnect()`.
     public func disconnect() async {
         connectionState = .disconnected
-        
+
         // Cancel response listener
         responseListenerTask?.cancel()
         responseListenerTask = nil
-        
-        // Close subscriptions
-        for subscriptionId in subscriptions.values {
-            await relayPool.closeSubscription(id: subscriptionId)
-        }
-        subscriptions.removeAll()
-        
+
+        // Fail any in-flight requests immediately rather than letting their
+        // timeouts fire half a minute from now.
+        failAllPendingRequests(with: NIP46.NIP46Error.signerDisconnected)
+
         if let responseSubscription = responseSubscription {
             await relayPool.closeSubscription(id: responseSubscription)
             self.responseSubscription = nil
         }
-        
+
         // Disconnect from relays
         await relayPool.disconnectAll()
-        
+
         // Clear state
         activeConnection = nil
         userPublicKey = nil
-        processedResponses.removeAll()
-        
+
         nip46Logger.info("Disconnected from remote signer")
     }
     
@@ -900,12 +910,20 @@ public class RemoteSignerManager {
     }
     
     /// Called when connection is lost to trigger automatic reconnection.
+    ///
+    /// Also invoked internally when the standing response subscription's
+    /// stream terminates, so reconnection is automatic — apps don't need to
+    /// detect drops themselves.
     public func handleConnectionLost() {
         guard case .connected = connectionState else { return }
-        
+
         connectionState = .disconnected
         nip46Logger.warning("Connection lost, attempting to reconnect")
-        
+
+        // In-flight requests can't complete without the subscription; fail
+        // them now instead of letting each ride out its full timeout.
+        failAllPendingRequests(with: NIP46.NIP46Error.signerDisconnected)
+
         scheduleReconnection()
     }
     
@@ -927,28 +945,82 @@ public class RemoteSignerManager {
         }
     }
     
+    /// Establishes the standing response subscription and its router.
+    ///
+    /// One subscription serves every request for the connection's lifetime.
+    /// Responses are matched to waiting requests by id — no per-request
+    /// subscription churn against the relays.
     private func subscribeToResponses(signerPubkey: String) async throws {
         guard let clientKP = clientKeyPair else { return }
-        
+
         // Cancel existing subscription
         responseListenerTask?.cancel()
+        responseListenerTask = nil
         if let existing = responseSubscription {
             await relayPool.closeSubscription(id: existing)
+            responseSubscription = nil
         }
-        
+
         // Subscribe to responses addressed to us
         let filter = Filter(
             authors: [signerPubkey],
             kinds: [EventKind.remoteSigningRequest.rawValue],
             p: [clientKP.publicKey]
         )
-        
+
         let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
         responseSubscription = subscription.id
-        
-        // No need to listen here - responses are handled per-request
+
+        let clientSecret = clientKP.privateKey
+        responseListenerTask = Task { [weak self] in
+            for await event in subscription.events {
+                guard let self else { return }
+                self.routeResponseEvent(event, signerPubkey: signerPubkey, clientSecret: clientSecret)
+            }
+            // The stream terminated: the subscription was closed or the pool
+            // was torn down underneath us. If this is still the active
+            // subscription, the connection is effectively lost.
+            self?.responseStreamEnded(subscriptionID: subscription.id)
+        }
     }
-    
+
+    /// Routes one incoming event to the request waiting on it.
+    private func routeResponseEvent(_ event: NostrEvent, signerPubkey: String, clientSecret: String) {
+        guard event.pubkey == signerPubkey,
+              event.kind == EventKind.remoteSigningRequest.rawValue else { return }
+
+        guard let response = try? NIP46.parseResponseEvent(
+            event: event,
+            clientSecret: clientSecret,
+            signerPubkey: signerPubkey
+        ) else { return }
+
+        // Auth challenges reuse the request id for the eventual real
+        // response, so they must not consume the id in the dedup window.
+        if !response.isAuthChallenge {
+            guard processedResponses.insert(response.id) else { return }
+        }
+
+        if let continuation = pendingRequests.removeValue(forKey: response.id) {
+            continuation.resume(returning: response)
+        }
+    }
+
+    private func responseStreamEnded(subscriptionID: String) {
+        guard responseSubscription == subscriptionID else { return }
+        responseSubscription = nil
+        handleConnectionLost()
+    }
+
+    /// Fails every in-flight request with `error`.
+    private func failAllPendingRequests(with error: Error) {
+        let pending = pendingRequests
+        pendingRequests.removeAll()
+        for (_, continuation) in pending {
+            continuation.resume(throwing: error)
+        }
+    }
+
     private func sendRequest(
         _ request: NIP46.Request,
         signerPubkey: String,
@@ -960,98 +1032,41 @@ public class RemoteSignerManager {
             signerPubkey: signerPubkey,
             clientKeyPair: clientKeyPair
         )
-        
+
         nip46Logger.debug("Sending request", metadata: LogMetadata([
             "method": request.method,
             "id": request.id.prefix(8).description
         ]))
-        
-        // Subscribe to response
-        let filter = Filter(
-            authors: [signerPubkey],
-            kinds: [EventKind.remoteSigningRequest.rawValue],
-            p: [clientKeyPair.publicKey]
-        )
-        
-        let subscription = try await relayPool.walletSubscribe(filters: [filter], id: nil)
-        subscriptions[request.id] = subscription.id
-        
+
+        // The standing response subscription must be live before the request
+        // goes out, or a fast signer's response can slip past us.
+        if responseSubscription == nil {
+            try await subscribeToResponses(signerPubkey: signerPubkey)
+        }
+
         // Publish request
         let publishResults = await relayPool.publish(requestEvent)
         guard publishResults.contains(where: { $0.success }) else {
-            await relayPool.closeSubscription(id: subscription.id)
-            subscriptions.removeValue(forKey: request.id)
             throw NIP46.NIP46Error.connectionFailed("Failed to publish request to any relay")
         }
-        
-        // Wait for response with timeout
-        let requestId = request.id
-        let clientSecret = clientKeyPair.privateKey
-        
-        do {
-            let result: NIP46.Response? = try await withThrowingTaskGroup(of: NIP46.Response?.self) { group in
-                // Response listener task
-                group.addTask {
-                    for await event in subscription.events {
-                        guard event.pubkey == signerPubkey else { continue }
-                        guard event.kind == EventKind.remoteSigningRequest.rawValue else { continue }
-                        
-                        // Try to parse response
-                        do {
-                            let response = try NIP46.parseResponseEvent(
-                                event: event,
-                                clientSecret: clientSecret,
-                                signerPubkey: signerPubkey
-                            )
-                            
-                            // Check if this response matches our request
-                            if response.id == requestId {
-                                return response
-                            }
-                        } catch {
-                            // Ignore parsing errors, keep listening
-                            continue
-                        }
-                    }
-                    return nil
-                }
-                
-                // Timeout task
-                group.addTask {
-                    try await Task.sleep(nanoseconds: Self.requestTimeoutNanoseconds)
-                    return nil
-                }
-                
-                if let first = try await group.next() {
-                    group.cancelAll()
-                    return first
-                }
-                
-                group.cancelAll()
-                return nil
+
+        // Await the routed response; the timeout task loses the claim race
+        // to the router (or wins it) — MainActor isolation makes the
+        // `removeValue` claim atomic, so exactly one path resumes.
+        let requestID = request.id
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<NIP46.Response, Error>) in
+            pendingRequests[requestID] = continuation
+
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: Self.requestTimeoutNanoseconds)
+                self?.timeoutRequest(requestID)
             }
-            
-            await relayPool.closeSubscription(id: subscription.id)
-            subscriptions.removeValue(forKey: request.id)
-            
-            guard let response = result else {
-                throw NIP46.NIP46Error.timeout
-            }
-            
-            // Mark as processed
-            processedResponses.insert(response.id)
-            
-            return response
-            
-        } catch is CancellationError {
-            await relayPool.closeSubscription(id: subscription.id)
-            subscriptions.removeValue(forKey: request.id)
-            throw NIP46.NIP46Error.connectionFailed("Request was cancelled")
-        } catch {
-            await relayPool.closeSubscription(id: subscription.id)
-            subscriptions.removeValue(forKey: request.id)
-            throw error
         }
+    }
+
+    private func timeoutRequest(_ requestID: String) {
+        guard let continuation = pendingRequests.removeValue(forKey: requestID) else { return }
+        continuation.resume(throwing: NIP46.NIP46Error.timeout)
     }
     
     private func scheduleReconnection() {

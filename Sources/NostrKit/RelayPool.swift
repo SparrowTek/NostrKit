@@ -59,9 +59,15 @@ public actor RelayPool {
     
     /// Represents a relay in the pool with its connection and metadata
     public struct Relay: Sendable {
-        /// The relay service instance
-        public let service: RelayService
-        
+        /// The connection driving this relay. `RelayService` in production;
+        /// tests inject scripted conformances to exercise pool behavior.
+        let connection: any RelayConnection
+
+        /// The production relay service backing this relay.
+        ///
+        /// `nil` only when a test injected a non-`RelayService` connection.
+        public var service: RelayService? { connection as? RelayService }
+
         /// The relay URL
         public let url: String
         
@@ -191,6 +197,24 @@ public actor RelayPool {
     /// Monitor tasks per relay URL, so they can be cancelled when the relay
     /// is removed (or when the whole pool shuts down) instead of leaking.
     private var monitorTasks: [String: Task<Void, Never>] = [:]
+
+    /// Pending reconnection backoff tasks per relay URL. Tracked so an
+    /// intentional disconnect, relay removal, or explicit connect can cancel
+    /// the timer instead of letting it dial a relay nobody wants anymore.
+    private var reconnectTasks: [String: Task<Void, Never>] = [:]
+
+    /// Relays the caller deliberately disconnected. A monitor exiting for one
+    /// of these URLs must NOT schedule an auto-reconnect — `disconnectAll()`
+    /// means *stay down* until the caller connects again.
+    private var intentionallyDisconnected: Set<String> = []
+
+    /// NIP-42 authenticator installed on every current and future relay.
+    private var authenticator: (@Sendable (AuthChallenge) async throws -> AuthResponse)?
+
+    /// Per-(subscription|relay) resubscribe attempts after a server-side
+    /// CLOSED, so a relay that keeps closing us can't cause an infinite REQ
+    /// loop. Reset when the relay (re)connects.
+    private var closedResubscribeAttempts: [String: Int] = [:]
     
     /// Configuration for the relay pool
     public let configuration: Configuration
@@ -227,12 +251,19 @@ public actor RelayPool {
         guard Validation.isValidRelayURL(url) else {
             throw NostrError.invalidURI(uri: url, reason: "Invalid WebSocket URL format")
         }
-        
+        return try addRelay(url: url, metadata: metadata, connection: RelayService(url: url))
+    }
+
+    /// Adds a relay backed by an explicit connection. Internal so tests can
+    /// inject scripted `RelayConnection` conformances; the public overload
+    /// always creates a real `RelayService`.
+    @discardableResult
+    func addRelay(url: String, metadata: RelayMetadata? = nil, connection: any RelayConnection) throws -> Relay {
         // Check if relay already exists
         if let existingRelay = relays[url] {
             return existingRelay
         }
-        
+
         // Check max connections
         if relays.count >= configuration.maxConnections {
             throw NostrError.rateLimited(
@@ -240,14 +271,13 @@ public actor RelayPool {
                 resetTime: nil
             )
         }
-        
-        let service = RelayService(url: url)
+
         let relay = Relay(
-            service: service,
+            connection: connection,
             url: url,
             metadata: metadata
         )
-        
+
         relays[url] = relay
 
         // Note: the monitor task is started in `connect(to:)`, not here.
@@ -263,12 +293,15 @@ public actor RelayPool {
         guard let relay = relays[url] else { return }
 
         // Cancel the monitor task first so it doesn't try to read the relay
-        // after we've removed it.
+        // after we've removed it, and kill any pending reconnect timer.
         monitorTasks.removeValue(forKey: url)?.cancel()
+        reconnectTasks.removeValue(forKey: url)?.cancel()
+        intentionallyDisconnected.remove(url)
+        clearClosedResubscribeAttempts(for: url)
 
         // Disconnect if connected
         if relay.state == .connected {
-            await relay.service.disconnect()
+            await relay.connection.disconnect()
         }
 
         // Clean up any pending OK responses
@@ -296,9 +329,12 @@ public actor RelayPool {
     /// Connects to a specific relay
     /// - Parameter url: The URL of the relay to connect
     public func connect(to url: String) async throws {
-        guard let service = relays[url]?.service else {
+        guard let connection = relays[url]?.connection else {
             throw NostrError.notFound(resource: "Relay with URL \(url)")
         }
+
+        // An explicit connect always re-arms auto-reconnect for this relay.
+        intentionallyDisconnected.remove(url)
 
         // A live connection stays live — re-dialing a healthy socket tears it
         // down mid-flight (cancelling handshakes and NIP-11 fetches) only to
@@ -307,16 +343,21 @@ public actor RelayPool {
 
         // A dial is already in flight — wait for it to resolve rather than
         // stomping the half-open socket with a second dial. Concurrent callers
-        // (retry loops, auto-reconnect timers) all converge on the one dial.
-        if relays[url]?.state == .connecting || relays[url]?.state == .reconnecting {
+        // (retry loops) all converge on the one dial.
+        if relays[url]?.state == .connecting {
             try await waitForInFlightDial(url: url)
             return
         }
 
+        // `.reconnecting` means a backoff timer is pending, not a live dial —
+        // the caller wants a connection NOW, so cancel the timer and dial.
+        reconnectTasks.removeValue(forKey: url)?.cancel()
+
         mutateRelay(url) { $0.state = .connecting }
 
         do {
-            try await service.connect()
+            await connection.setAuthenticator(authenticator)
+            try await connection.connect()
 
             mutateRelay(url) {
                 $0.state = .connected
@@ -325,16 +366,24 @@ public actor RelayPool {
                 $0.lastError = nil
                 $0.healthScore = 1.0
             }
+            clearClosedResubscribeAttempts(for: url)
 
             // Start a fresh monitor for this connection. The previous monitor
             // (if any) has already exited because its message stream finished
             // when the prior connection dropped; we cancel defensively in case
             // it was still in-flight, then attach to the new stream that
-            // `service.connect()` rebuilt.
+            // `connection.connect()` rebuilt.
             monitorTasks[url]?.cancel()
             monitorTasks[url] = Task { [weak self] in
                 await self?.monitorRelay(url: url)
             }
+
+            // Re-attach every active subscription. On a RECONNECT this is what
+            // keeps long-lived subscriptions alive — the previous socket's
+            // REQs died with it, and a bunker that silently loses its request
+            // subscription is deaf. On a first connect it attaches
+            // subscriptions that were registered while this relay was down.
+            await attachSubscriptions(to: url)
 
             // Fetch relay information
             await fetchRelayInformation(for: url)
@@ -354,7 +403,7 @@ public actor RelayPool {
 
             // Schedule reconnection if enabled
             if configuration.autoReconnect {
-                await scheduleReconnection(for: url)
+                scheduleReconnection(for: url)
             }
 
             throw error
@@ -398,12 +447,20 @@ public actor RelayPool {
         }
     }
     
-    /// Disconnects from a specific relay
+    /// Disconnects from a specific relay and keeps it down.
+    ///
+    /// This is an *intentional* disconnect: auto-reconnect is suppressed for
+    /// this relay until the next `connect(to:)`/`connectAll()`.
     /// - Parameter url: The URL of the relay to disconnect
     public func disconnect(from url: String) async {
-        guard let service = relays[url]?.service else { return }
+        guard let connection = relays[url]?.connection else { return }
 
-        await service.disconnect()
+        // Mark BEFORE tearing down the socket: the monitor observes the
+        // stream finishing and must already know this drop is deliberate.
+        intentionallyDisconnected.insert(url)
+        reconnectTasks.removeValue(forKey: url)?.cancel()
+
+        await connection.disconnect()
         mutateRelay(url) { $0.state = .disconnected }
         
         // Clean up any pending OK responses
@@ -495,36 +552,44 @@ public actor RelayPool {
     
     // MARK: - Subscriptions
     
-    /// Creates a subscription across all readable relays
+    /// Creates a subscription across all readable relays.
+    ///
+    /// The subscription is registered with the pool first and attached to
+    /// every currently-connected readable relay. Relays that are offline (or
+    /// added later) pick the subscription up automatically when they connect —
+    /// so subscribing while temporarily offline succeeds and goes live as
+    /// relays come up, and reconnects transparently re-establish it.
+    ///
     /// - Parameters:
     ///   - filters: Filters for the subscription
     ///   - id: Optional subscription ID (generated if not provided)
     /// - Returns: A pool subscription that aggregates events from all relays
+    /// - Throws: `NostrError.notFound` if the pool has no relays at all
     public func subscribe(
         filters: [Filter],
         id: String? = nil
     ) async throws -> PoolSubscription {
         let subscriptionId = id ?? UUID().uuidString
-        
-        let readableRelays = healthyRelays.filter { relay in
-            relay.metadata?.read ?? true
+
+        guard !relays.isEmpty else {
+            throw NostrError.notFound(resource: "No relays in pool")
         }
-        
-        guard !readableRelays.isEmpty else {
-            throw NostrError.notFound(resource: "No readable relays available")
-        }
-        
+
         let subscription = PoolSubscription(
             id: subscriptionId,
             filters: filters,
             pool: self
         )
-        
+
         subscriptions[subscriptionId] = subscription
-        
-        // Subscribe on all readable relays
-        await subscription.subscribeToRelays(readableRelays.map { $0.url })
-        
+
+        // Attach to whatever is connected right now; the rest attach on
+        // (re)connect via `attachSubscriptions(to:)`.
+        let readableURLs = connectedRelays
+            .filter { $0.metadata?.read ?? true }
+            .map { $0.url }
+        await subscription.subscribeToRelays(readableURLs)
+
         return subscription
     }
     
@@ -532,9 +597,28 @@ public actor RelayPool {
     /// - Parameter id: The subscription ID to close
     public func closeSubscription(id: String) async {
         guard let subscription = subscriptions[id] else { return }
-        
+
         await subscription.close()
         subscriptions.removeValue(forKey: id)
+    }
+
+    // MARK: - Authentication (NIP-42)
+
+    /// Installs a NIP-42 authenticator on every current and future relay in
+    /// the pool. Relays that demand auth (AUTH challenges, `auth-required:`
+    /// CLOSED reasons) are answered automatically once this is set.
+    public func setAuthenticator(_ handler: (@Sendable (AuthChallenge) async throws -> AuthResponse)?) async {
+        authenticator = handler
+        for relay in relays.values {
+            await relay.connection.setAuthenticator(handler)
+        }
+    }
+
+    /// Convenience: authenticate to relays with the given key pair.
+    public func setAuthenticator(keyPair: KeyPair) async {
+        await setAuthenticator { challenge in
+            try CoreNostr.authenticate(challenge: challenge, keyPair: keyPair)
+        }
     }
     
     // MARK: - Private Methods
@@ -571,7 +655,7 @@ public actor RelayPool {
 
             Task {
                 do {
-                    try await relay.service.publishEvent(event)
+                    try await relay.connection.publishEvent(event)
 
                     mutateRelay(relayURL) {
                         $0.stats.eventsSent += 1
@@ -616,13 +700,13 @@ public actor RelayPool {
     }
     
     private func monitorRelay(url: String) async {
-        guard let service = relays[url]?.service else { return }
+        guard let connection = relays[url]?.connection else { return }
 
         // Snapshot the messages stream for this connection. Each call to
-        // `service.connect()` mints a fresh stream, so this loop is bound to
+        // `connect()` mints a fresh stream, so this loop is bound to
         // exactly one connection's lifetime; on disconnect it exits and the
         // next successful connect spawns a new monitor task.
-        let stream = await service.messages
+        let stream = await connection.messages
         for await message in stream {
             // Stats update is done synchronously via the helper so any
             // concurrent mutation (e.g. `publishToRelay` bumping `eventsSent`)
@@ -656,6 +740,7 @@ public actor RelayPool {
                 }
             case .closed(let subscriptionId, let closedMessage):
                 poolLogger.info("Subscription \(subscriptionId) closed by \(url): \(closedMessage ?? "No reason")")
+                handleServerClosedSubscription(subscriptionId, on: url, reason: closedMessage)
             default:
                 break
             }
@@ -669,15 +754,81 @@ public actor RelayPool {
         // Connection dropped — this monitor task is done. Drop our handle so
         // a future `connect(to:)` doesn't see a stale entry, then optionally
         // schedule a reconnection that will spawn a fresh monitor on success.
+        // A deliberate `disconnect(from:)` stays down: reconnecting after the
+        // caller asked to disconnect would resurrect connections forever.
         mutateRelay(url) { $0.state = .disconnected }
         monitorTasks.removeValue(forKey: url)
 
-        if configuration.autoReconnect {
-            await scheduleReconnection(for: url)
+        if configuration.autoReconnect && !intentionallyDisconnected.contains(url) {
+            scheduleReconnection(for: url)
+        }
+    }
+
+    /// A relay closed one of our subscriptions server-side (CLOSED message).
+    ///
+    /// Left alone this deafens the subscription on that relay even though the
+    /// socket is healthy — fatal for long-lived listeners like a NIP-46
+    /// bunker. Retry a bounded number of times; an `auth-required:` reason
+    /// waits for the NIP-42 handshake (driven by the relay service's
+    /// authenticator) before re-REQ-ing.
+    private func handleServerClosedSubscription(_ subscriptionId: String, on url: String, reason: String?) {
+        guard subscriptions[subscriptionId] != nil else { return }
+
+        let attemptKey = "\(subscriptionId)|\(url)"
+        let attempts = closedResubscribeAttempts[attemptKey, default: 0]
+        guard attempts < 3 else {
+            poolLogger.warning("Subscription \(subscriptionId) closed by \(url) \(attempts) times — not retrying")
+            return
+        }
+        closedResubscribeAttempts[attemptKey] = attempts + 1
+
+        let authRequired = reason?.hasPrefix("auth-required:") == true
+        if authRequired && authenticator == nil {
+            poolLogger.warning("\(url) requires NIP-42 auth for subscription \(subscriptionId) but no authenticator is set")
+            return
+        }
+
+        // Detached so the monitor loop keeps draining messages while we wait;
+        // the auth delay gives the relay service's AUTH round-trip time to
+        // complete before the re-REQ.
+        Task { [weak self] in
+            try? await Task.sleep(for: authRequired ? .seconds(1) : .milliseconds(250))
+            await self?.finishClosedResubscribe(subscriptionId, on: url)
+        }
+    }
+
+    private func finishClosedResubscribe(_ subscriptionId: String, on url: String) async {
+        guard let subscription = subscriptions[subscriptionId] else { return }
+        guard relays[url]?.state == .connected else { return }
+        await subscription.attachRelay(url)
+    }
+
+    /// Re-attaches every active subscription to a relay that just
+    /// (re)connected. REQs reusing a subscription id replace the previous
+    /// server-side subscription, so this is safe on fresh connects too.
+    private func attachSubscriptions(to url: String) async {
+        guard let relay = relays[url], relay.metadata?.read ?? true else { return }
+        for subscription in subscriptions.values {
+            await subscription.attachRelay(url)
+        }
+    }
+
+    private func clearClosedResubscribeAttempts(for url: String) {
+        let suffix = "|\(url)"
+        for key in closedResubscribeAttempts.keys where key.hasSuffix(suffix) {
+            closedResubscribeAttempts.removeValue(forKey: key)
         }
     }
     
-    private func scheduleReconnection(for url: String) async {
+    /// Schedules a backoff-delayed reconnect as a tracked, cancellable task.
+    ///
+    /// Task-based (rather than sleeping inline) so intentional disconnects and
+    /// relay removal can cancel a pending timer, and so repeated failures
+    /// chain through fresh tasks instead of recursing through an ever-growing
+    /// await stack during long outages.
+    private func scheduleReconnection(for url: String) {
+        guard reconnectTasks[url] == nil else { return }
+        guard !intentionallyDisconnected.contains(url) else { return }
         guard let updated = mutateRelay(url, { $0.state = .reconnecting }) else { return }
 
         let delay = min(
@@ -685,11 +836,19 @@ public actor RelayPool {
             configuration.maxReconnectDelay
         )
 
-        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-
-        if let currentRelay = relays[url], currentRelay.state == .reconnecting {
-            try? await connect(to: url)
+        reconnectTasks[url] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            await self.performScheduledReconnect(for: url)
         }
+    }
+
+    private func performScheduledReconnect(for url: String) async {
+        reconnectTasks[url] = nil
+        guard relays[url]?.state == .reconnecting else { return }
+        // A failed dial schedules the next attempt itself (with an increased
+        // failure count feeding the backoff).
+        try? await connect(to: url)
     }
     
     /// Adjusts a relay's `healthScore` (0.0–1.0) by a per-event-type delta and
@@ -807,47 +966,65 @@ public actor RelayPool {
 
 /// A subscription that aggregates events from multiple relays
 public actor PoolSubscription {
-    public let id: String
-    public let filters: [Filter]
+    /// Cap on remembered event ids for deduplication. Long-lived
+    /// subscriptions (a NIP-46 bunker listens for days) would otherwise grow
+    /// this set without bound. Oldest ids are evicted first; a relay
+    /// re-delivering an event older than the window re-yields it, which
+    /// consumers already tolerate far better than unbounded memory growth.
+    private static let maxSeenEventIds = 4096
+
+    nonisolated public let id: String
+    nonisolated public let filters: [Filter]
     private weak var pool: RelayPool?
     private var relaySubscriptions: [String: Bool] = [:] // URL -> isEOSE
     private var seenEventIds: Set<String> = []
+    private var seenEventOrder: [String] = []
     private let eventSubject = AsyncStream<NostrEvent>.makeStream()
-    
+
     /// Stream of deduplicated events from all relays
     public var events: AsyncStream<NostrEvent> {
         eventSubject.stream
     }
-    
+
     init(id: String, filters: [Filter], pool: RelayPool) {
         self.id = id
         self.filters = filters
         self.pool = pool
     }
-    
+
     func subscribeToRelays(_ urls: [String]) async {
-        guard let pool = pool else { return }
-        
         for url in urls {
-            guard let relay = await pool.getRelay(url),
-                  relay.state == .connected else { continue }
-            
-            do {
-                try await relay.service.subscribe(id: id, filters: filters)
-                relaySubscriptions[url] = false
-            } catch {
-                subscriptionLogger.warning("Failed to subscribe to \(url): \(error)")
-            }
+            await attachRelay(url)
         }
     }
-    
+
+    /// Sends this subscription's REQ to one connected relay.
+    ///
+    /// Called on initial subscribe AND every time a relay (re)connects —
+    /// resetting the relay's EOSE flag so end-of-stored-events is tracked per
+    /// connection, not per process lifetime. Re-REQ-ing an id the relay
+    /// already knows simply replaces the server-side subscription (NIP-01).
+    func attachRelay(_ url: String) async {
+        guard let pool = pool else { return }
+        guard let relay = await pool.getRelay(url),
+              relay.state == .connected else { return }
+
+        do {
+            try await relay.connection.subscribe(id: id, filters: filters)
+            relaySubscriptions[url] = false
+        } catch {
+            subscriptionLogger.warning("Failed to subscribe to \(url): \(error)")
+        }
+    }
+
     func handleMessage(_ message: RelayMessage, from url: String) async {
         switch message {
         case .event(let subId, let event):
             if subId == id {
-                // Deduplicate events
-                if !seenEventIds.contains(event.id) {
-                    seenEventIds.insert(event.id)
+                // Deduplicate events, bounding the memory used to remember them
+                if seenEventIds.insert(event.id).inserted {
+                    seenEventOrder.append(event.id)
+                    trimSeenEventsIfNeeded()
                     // Log NWC response events for debugging
                     if event.kind == EventKind.nwcResponse.rawValue {
                         subscriptionLogger.debug("Yielding NWC response - subId: \(id.prefix(8)), eventId: \(event.id.prefix(16))")
@@ -872,22 +1049,34 @@ public actor PoolSubscription {
             break
         }
     }
-    
+
+    /// Evicts the oldest remembered event ids once the cap is exceeded.
+    /// Trims in batches so the O(n) array compaction amortizes instead of
+    /// running on every event at the cap.
+    private func trimSeenEventsIfNeeded() {
+        guard seenEventOrder.count > Self.maxSeenEventIds + 512 else { return }
+        let overflow = seenEventOrder.count - Self.maxSeenEventIds
+        for evicted in seenEventOrder.prefix(overflow) {
+            seenEventIds.remove(evicted)
+        }
+        seenEventOrder.removeFirst(overflow)
+    }
+
     func removeRelay(url: String) async {
         relaySubscriptions.removeValue(forKey: url)
     }
-    
+
     func close() async {
         guard let pool = pool else { return }
-        
+
         // Close subscription on all relays
         for url in relaySubscriptions.keys {
             if let relay = await pool.getRelay(url),
                relay.state == .connected {
-                try? await relay.service.closeSubscription(id: id)
+                try? await relay.connection.closeSubscription(id: id)
             }
         }
-        
+
         eventSubject.continuation.finish()
     }
 }
